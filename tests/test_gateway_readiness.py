@@ -5,7 +5,8 @@ from unittest.mock import AsyncMock
 from cronos.gateway import create_app
 
 
-async def test_readiness_requires_successful_telegram_poll():
+async def test_readiness_requires_successful_telegram_poll(monkeypatch):
+    monkeypatch.setattr(time, "monotonic", lambda: 42.0)
     app = create_app()
     ready = next(
         route.endpoint for route in app.routes if getattr(route, "path", None) == "/readyz"

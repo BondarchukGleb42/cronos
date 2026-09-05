@@ -67,7 +67,9 @@ jobs:
           asyncio.run(main())
           PY
       - name: Migrate test database
-        run: uv run --no-sync python -m cronos.storage
+        run: |
+          uv run --no-sync python -m cronos.storage
+          uv run --no-sync python -c "import asyncio; from cronos.agent import setup_checkpoints; from cronos.settings import get_settings; asyncio.run(setup_checkpoints(get_settings()))"
       - name: Install fonts for PDF tests
         run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends fonts-dejavu-core
       - name: Ruff

@@ -75,6 +75,13 @@ def environment():
             continue
         if key.strip() in names:
             env[names[key.strip()]] = value.strip().strip("\"'")
+    certificates = list(
+        (Path(__file__).resolve().parents[1] / ".venv" / "lib").glob(
+            "python*/site-packages/certifi/cacert.pem"
+        )
+    )
+    if certificates:
+        env["SSL_CERT_FILE"] = str(certificates[0])
     env["PROVIDER_TLS12"] = "true"
     env["ARTIFACTS_DIR"] = str(Path(__file__).resolve().parents[1] / ".local" / "artifacts")
     return env

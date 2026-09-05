@@ -113,6 +113,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         try:
             healthy = (
                 not application.state.poll_task.done()
+                and application.state.last_poll_success > 0
                 and time.monotonic() - application.state.last_poll_success < 90
                 and await application.state.store.ready()
             )
