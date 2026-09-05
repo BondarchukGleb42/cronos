@@ -1,0 +1,231 @@
+{
+  "verified_at": "2026-09-05T17:13:08.743093+00:00",
+  "context": "yc-gradius",
+  "namespace": "cronos-bot",
+  "deployed_commit": "8815d32b645b6a4bb3dca9cc7981c72b9ab4dbf0",
+  "ci_run": "https://github.com/BondarchukGleb42/cronos/actions/runs/33979956500",
+  "pytest_passed": 155,
+  "kubeconfig_tests_passed": 9,
+  "containers": [
+    {
+      "pod": "cronos-gateway-6689987994-4z68j",
+      "container": "gateway",
+      "image": "cr.yandex/crpe8jmbmklfe4l31c68/cronos:8815d32b645b6a4bb3dca9cc7981c72b9ab4dbf0",
+      "ready": true,
+      "restarts": 0,
+      "resources": {
+        "limits": {
+          "cpu": "250m",
+          "ephemeral-storage": "128Mi",
+          "memory": "256Mi"
+        },
+        "requests": {
+          "cpu": "50m",
+          "ephemeral-storage": "32Mi",
+          "memory": "96Mi"
+        }
+      },
+      "telegram_proxy_secret_ref": {
+        "key": "TELEGRAM_PROXY",
+        "name": "cronos-app"
+      }
+    },
+    {
+      "pod": "cronos-runtime-6cb966568f-hs28k",
+      "container": "worker",
+      "image": "cr.yandex/crpe8jmbmklfe4l31c68/cronos:8815d32b645b6a4bb3dca9cc7981c72b9ab4dbf0",
+      "ready": true,
+      "restarts": 0,
+      "resources": {
+        "limits": {
+          "cpu": "1",
+          "ephemeral-storage": "1Gi",
+          "memory": "1536Mi"
+        },
+        "requests": {
+          "cpu": "150m",
+          "ephemeral-storage": "128Mi",
+          "memory": "256Mi"
+        }
+      },
+      "telegram_proxy_secret_ref": {
+        "key": "TELEGRAM_PROXY",
+        "name": "cronos-app"
+      }
+    },
+    {
+      "pod": "cronos-runtime-6cb966568f-hs28k",
+      "container": "coordinator",
+      "image": "cr.yandex/crpe8jmbmklfe4l31c68/cronos:8815d32b645b6a4bb3dca9cc7981c72b9ab4dbf0",
+      "ready": true,
+      "restarts": 0,
+      "resources": {
+        "limits": {
+          "cpu": "200m",
+          "ephemeral-storage": "256Mi",
+          "memory": "256Mi"
+        },
+        "requests": {
+          "cpu": "25m",
+          "ephemeral-storage": "32Mi",
+          "memory": "64Mi"
+        }
+      },
+      "telegram_proxy_secret_ref": {
+        "key": "TELEGRAM_PROXY",
+        "name": "cronos-app"
+      }
+    },
+    {
+      "pod": "postgres-0",
+      "container": "postgres",
+      "image": "postgres:17-alpine@sha256:18cfe3ef5e6815560c98237d6216d1e5119702fb0f3894c8785dd58b8bbe5d73",
+      "ready": true,
+      "restarts": 0,
+      "resources": {
+        "limits": {
+          "cpu": "500m",
+          "ephemeral-storage": "512Mi",
+          "memory": "512Mi"
+        },
+        "requests": {
+          "cpu": "100m",
+          "ephemeral-storage": "64Mi",
+          "memory": "128Mi"
+        }
+      },
+      "telegram_proxy_secret_ref": null
+    },
+    {
+      "pod": "rabbitmq-0",
+      "container": "rabbitmq",
+      "image": "rabbitmq:4-alpine@sha256:3486d98205df3d6395ed70e7924baa13b561cbac54116c0ddae5b0b7382bbabd",
+      "ready": true,
+      "restarts": 0,
+      "resources": {
+        "limits": {
+          "cpu": "500m",
+          "ephemeral-storage": "512Mi",
+          "memory": "384Mi"
+        },
+        "requests": {
+          "cpu": "100m",
+          "ephemeral-storage": "64Mi",
+          "memory": "128Mi"
+        }
+      },
+      "telegram_proxy_secret_ref": null
+    },
+    {
+      "pod": "redis-7b7457687b-27pgb",
+      "container": "redis",
+      "image": "redis:7-alpine@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf",
+      "ready": true,
+      "restarts": 0,
+      "resources": {
+        "limits": {
+          "cpu": "100m",
+          "ephemeral-storage": "128Mi",
+          "memory": "128Mi"
+        },
+        "requests": {
+          "cpu": "25m",
+          "ephemeral-storage": "64Mi",
+          "memory": "32Mi"
+        }
+      },
+      "telegram_proxy_secret_ref": null
+    }
+  ],
+  "quota": {
+    "hard": {
+      "count/configmaps": "16",
+      "count/secrets": "12",
+      "limits.cpu": "4",
+      "limits.ephemeral-storage": "8Gi",
+      "limits.memory": "6Gi",
+      "persistentvolumeclaims": "4",
+      "pods": "12",
+      "requests.cpu": "2",
+      "requests.ephemeral-storage": "4Gi",
+      "requests.memory": "4Gi",
+      "requests.storage": "20Gi",
+      "services": "8",
+      "services.loadbalancers": "0",
+      "services.nodeports": "0"
+    },
+    "used": {
+      "count/configmaps": "3",
+      "count/secrets": "3",
+      "limits.cpu": "2550m",
+      "limits.ephemeral-storage": "2560Mi",
+      "limits.memory": "3Gi",
+      "persistentvolumeclaims": "3",
+      "pods": "5",
+      "requests.cpu": "450m",
+      "requests.ephemeral-storage": "384Mi",
+      "requests.memory": "704Mi",
+      "requests.storage": "11Gi",
+      "services": "4",
+      "services.loadbalancers": "0",
+      "services.nodeports": "0"
+    }
+  },
+  "users": {
+    "real_users": 1,
+    "active_real_runs": 0
+  },
+  "smoke": {
+    "job": "cronos-smoke-8815d32b645b-e8eb5ff0",
+    "context": "yc-gradius",
+    "namespace": "cronos-bot",
+    "image": "cr.yandex/crpe8jmbmklfe4l31c68/cronos:8815d32b645b6a4bb3dca9cc7981c72b9ab4dbf0",
+    "sha": "8815d32b645b6a4bb3dca9cc7981c72b9ab4dbf0",
+    "source_sha256": "a24cf73ecbb48cdd8416f8287e7a1a4df1699e5c4e99808f92504086b2d0c286",
+    "status": "passed",
+    "created": false,
+    "model_free_override": null,
+    "pass_marker": true,
+    "scenarios": [
+      {
+        "scenario": "memory",
+        "required_tool_observed": true,
+        "preview_frames": 1,
+        "cost_rub": "0.079213",
+        "checks": {
+          "memory_persisted": true,
+          "stored_facts": 2
+        }
+      },
+      {
+        "scenario": "search",
+        "required_tool_observed": true,
+        "preview_frames": 2,
+        "cost_rub": "0.695568",
+        "checks": {
+          "search_sources": 20
+        }
+      },
+      {
+        "scenario": "file",
+        "required_tool_observed": true,
+        "preview_frames": 1,
+        "cost_rub": "0.079759",
+        "checks": {
+          "csv_readback_rows": 2,
+          "csv_metadata_matches": true
+        }
+      }
+    ],
+    "updated_at": "2026-09-05T17:11:24.977200+00:00"
+  },
+  "network_policy_enforced": false,
+  "telegram_delivery": {
+    "real_users": 1,
+    "user_messages": 6,
+    "sent_replies": 6,
+    "confirmed_reply_ids": 6,
+    "failed_deliveries": 0,
+    "latest_reply_at": "2026-09-05T17:04:20.033831+00:00"
+  }
+}
