@@ -49,7 +49,7 @@ Runtime выбирает конкретные ключи через `secretKeyRe
 
 Для автоматической публикации и развертывания в GitHub Actions нужны репозиторные Secrets:
 
-- `YC_JSON_CREDENTIALS`: JSON авторизованного ключа, имеющего доступ на push в registry
+- `YC_SA_JSON_CREDENTIALS`: JSON авторизованного ключа, имеющего доступ на push в registry
   `crpe8jmbmklfe4l31c68`. Если kubeconfig использует YC exec-аутентификацию, этому же
   аккаунту нужен заранее настроенный доступ к ресурсам приложения в `cronos-bot`.
 - `KUBE_CONFIG`: kubeconfig как YAML/JSON или его base64-представление; в нем должен быть
@@ -59,7 +59,7 @@ Runtime выбирает конкретные ключи через `secretKeyRe
 Временный kubeconfig имеет права `0600` и удаляется после deploy job.
 Статический token/certificate из kubeconfig сохраняется. Для конфигурации с
 `yc ... create-token` абсолютный путь и локальный профиль YC заменяются короткоживущим
-IAM token от `YC_JSON_CREDENTIALS`; установка CLI пользователя на runner не требуется.
+IAM token от `YC_SA_JSON_CREDENTIALS`; установка CLI пользователя на runner не требуется.
 Другие exec-плагины не запускаются. Если у CI-аккаунта нет требуемых прав, deploy
 завершается ошибкой; workflow не создает права автоматически.
 
@@ -83,7 +83,7 @@ Dockerfile устанавливает зависимости по `uv.lock` с u
 а в runtime устанавливает `fonts-dejavu-core` для кириллицы в PDF. Образ один для всех
 трех процессов и миграции. Тег `latest` не используется.
 
-Если `YC_JSON_CREDENTIALS` отсутствует, проверки и сборка все равно выполняются.
+Если `YC_SA_JSON_CREDENTIALS` отсутствует, проверки и сборка все равно выполняются.
 Workflow экспортирует образ с тем же полным SHA-тегом в `cronos-image.tar` и сохраняет
 GitHub Artifact `cronos-image-<полный SHA коммита>` на один день без дополнительного сжатия.
 В summary явно указан режим `Artifact only`, выход build job `published=false`, а deploy
