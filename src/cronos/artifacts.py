@@ -539,13 +539,20 @@ class ArtifactManager:
             stream = io.StringIO(newline="")
             writer = csv.writer(stream)
             records = ([columns] if columns else []) + rows
-            if not records:
+            if not rows and content.strip():
                 try:
-                    records = _csv_records(content.removeprefix("\ufeff"), strict=True) or [[""]]
+                    parsed = _csv_records(content.removeprefix("\ufeff"), strict=True)
                 except csv.Error as error:
                     raise ValueError(
                         "Некорректный CSV: передайте columns и rows или корректный CSV в content"
                     ) from error
+                if columns and (not parsed or parsed[0] != columns):
+                    raise ValueError(
+                        "Заголовок CSV в content должен совпадать с columns; иначе передайте данные в rows"
+                    )
+                records = parsed
+            if not records:
+                records = [[""]]
             writer.writerows([_csv_value(value) for value in row] for row in records)
             data = stream.getvalue().encode("utf-8-sig")
         elif format == "txt":

@@ -16,8 +16,8 @@ class Settings(BaseSettings):
     alltokens_api_key: SecretStr = SecretStr("")
     alltokens_base_url: str = "https://api.alltokens.ru/api/v1"
     provider_tls12: bool = False
-    model_free: str = "mistralai/mistral-nemo"
-    model_tools: str = "qwen/qwen3.7-flash"
+    model_free: str = "deepseek/deepseek-v4-flash"
+    model_tools: str = "deepseek/deepseek-v4-flash"
     model_vision: str = "qwen/qwen3.7-flash"
     model_reasoning: str = "deepseek/deepseek-v4-flash"
     model_search: str = "perplexity/sonar"

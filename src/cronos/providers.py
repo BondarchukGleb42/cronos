@@ -1,11 +1,15 @@
 """Model transport and verified AllTokens response normalization."""
 
+import asyncio
 import base64
 import binascii
 import json
+import math
 import ssl
 from collections.abc import AsyncIterator, Awaitable, Callable
+from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
+from email.utils import parsedate_to_datetime
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -22,6 +26,64 @@ REASONING_MODELS = {
     "inclusionai/ling-3.0-flash",
 }
 RETRYABLE_STATUSES = {404, 408, 429, 500, 502, 503, 504}
+SAFE_ERROR_CODES = {
+    "rate_limit",
+    "rate_limit_exceeded",
+    "rate_limited",
+    "too_many_requests",
+    "quota_exceeded",
+    "insufficient_quota",
+    "resource_exhausted",
+    "model_overloaded",
+    "server_overloaded",
+    "overloaded",
+    "request_limit_reached",
+}
+
+
+def _retry_after_seconds(value: str | None, attempt: int, *, now=None) -> float:
+    fallback = float(min(2**attempt, 2))
+    if not value:
+        return fallback
+    try:
+        delay = float(value)
+    except ValueError:
+        try:
+            deadline = parsedate_to_datetime(value)
+            if deadline.tzinfo is None:
+                deadline = deadline.replace(tzinfo=UTC)
+            delay = max(0.0, (deadline - (now or datetime.now(UTC))).total_seconds())
+        except TypeError, ValueError, OverflowError:
+            return fallback
+    return min(delay, 30.0) if math.isfinite(delay) and delay >= 0 else fallback
+
+
+async def _http_failure(exc: APIStatusError, model: str, attempt: int, retry_available: bool):
+    # Keep only known machine codes; error messages may echo private input or credentials.
+    body = exc.body if isinstance(exc.body, dict) else {}
+    error = body.get("error", body)
+    code = error.get("code", error.get("type")) if isinstance(error, dict) else None
+    normalized = str(code).lower() if code is not None else ""
+    if normalized not in SAFE_ERROR_CODES and normalized not in {str(n) for n in range(100, 600)}:
+        normalized = f"http_{exc.status_code}"
+    metadata = {
+        "model": model,
+        "status": "http_error",
+        "code": exc.status_code,
+        "error_code": normalized,
+        "request_id": exc.request_id,
+        "cost_unknown": exc.status_code >= 500 or exc.status_code == 408,
+    }
+    if exc.status_code == 429:
+        delay = (
+            _retry_after_seconds(exc.response.headers.get("retry-after"), attempt)
+            if retry_available
+            else 0.0
+        )
+        metadata["retry_delay_seconds"] = delay
+        if retry_available:
+            await asyncio.sleep(delay)
+    return metadata
 
 
 class ProviderError(RuntimeError):
@@ -275,7 +337,7 @@ class Provider:
 
     async def _completion(self, payload: dict[str, Any], models: list[str]) -> dict[str, Any]:
         attempts: list[dict[str, Any]] = []
-        for model in models[:3]:
+        for attempt, model in enumerate(models[:3]):
             try:
                 request_payload = dict(payload)
                 if model in REASONING_MODELS:
@@ -297,13 +359,7 @@ class Provider:
                     raise ValueError("Expected an object response")
             except APIStatusError as exc:
                 attempts.append(
-                    {
-                        "model": model,
-                        "status": "http_error",
-                        "code": exc.status_code,
-                        "request_id": exc.request_id,
-                        "cost_unknown": exc.status_code >= 500 or exc.status_code == 408,
-                    }
+                    await _http_failure(exc, model, attempt, attempt + 1 < min(3, len(models)))
                 )
                 if exc.status_code in RETRYABLE_STATUSES:
                     continue
@@ -413,7 +469,7 @@ class Provider:
         on_delta: Callable[[str], Awaitable[None]],
     ) -> dict[str, Any]:
         attempts: list[dict[str, Any]] = []
-        for model in models[:3]:
+        for attempt, model in enumerate(models[:3]):
             stream = _StreamResult(model)
             opened = False
             preview_failed = False
@@ -451,13 +507,9 @@ class Provider:
                         raise ValueError("Truncated stream")
             except APIStatusError as exc:
                 attempts.append(
-                    {
-                        "model": model,
-                        "status": "http_error",
-                        "code": exc.status_code,
-                        "request_id": exc.request_id,
-                        "cost_unknown": exc.status_code >= 500 or exc.status_code == 408,
-                    }
+                    await _http_failure(
+                        exc, model, attempt, not opened and attempt + 1 < min(3, len(models))
+                    )
                 )
                 if not opened and exc.status_code in RETRYABLE_STATUSES:
                     continue

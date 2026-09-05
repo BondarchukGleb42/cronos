@@ -198,7 +198,7 @@ async def test_connection_failure_before_headers_can_use_tools_fallback():
             model="custom/model",
             on_delta=ignore_delta,
         )
-        assert models == ["custom/model", "qwen/qwen3.7-flash"]
+        assert models == ["custom/model", p.settings.model_tools]
         assert [attempt["status"] for attempt in result["attempts"]] == [
             "connection_error",
             "success",
@@ -228,7 +228,7 @@ async def test_three_attempt_limit_and_http_auth_does_not_retry():
                 model="custom/model",
                 on_delta=ignore_delta,
             )
-        assert models == ["custom/model", "qwen/qwen3.7-flash", "qwen/qwen3.7-flash"]
+        assert models == ["custom/model", p.settings.model_tools, p.settings.model_tools]
         assert len(caught.value.attempts) == 3
     finally:
         await p.close()

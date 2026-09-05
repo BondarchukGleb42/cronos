@@ -126,6 +126,21 @@ def test_csv_content_still_escapes_formula_cells(manager):
     assert manager.read(42, artifact["path"])["tables"][0]["rows"] == [["safe", "'=SUM(1,2)"]]
 
 
+def test_csv_content_with_explicit_header_keeps_data_rows(manager):
+    artifact = manager.generate(
+        42, "csv", "products.csv", "Продукт,Цена\nЯблоко,120\nГруша,90", ["Продукт", "Цена"]
+    )
+    table = manager.read(42, artifact["path"])["tables"][0]
+    assert table["columns"] == ["Продукт", "Цена"]
+    assert table["rows"] == [["Яблоко", "120"], ["Груша", "90"]]
+
+
+def test_csv_conflicting_content_header_is_rejected_without_silent_data_loss(manager):
+    with pytest.raises(ValueError, match="Заголовок CSV"):
+        manager.generate(42, "csv", "products.csv", "Product,Price\nApple,120", ["Продукт", "Цена"])
+    assert list((manager.root / "42").iterdir()) == []
+
+
 def test_csv_explicit_cells_take_precedence_over_document_content(manager):
     artifact = manager.generate(
         42,

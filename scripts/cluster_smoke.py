@@ -259,6 +259,11 @@ def main(argv=None):
             summary["source_sha256"] = (
                 job["metadata"].get("annotations", {}).get("cronos/source-sha256")
             )
+            summary["model_free_override"] = next(
+                (env.get("value") for env in pod["containers"][0].get("env", [])
+                 if env["name"] == "MODEL_FREE"),
+                None,
+            )
             summary["status"] = job_status(job)
             if summary["status"] in {"completed", "failed"} or time.monotonic() >= until:
                 break

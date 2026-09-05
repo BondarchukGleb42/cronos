@@ -64,7 +64,9 @@ password-protected Redis, ResourceQuota and LimitRange provide enforceable bound
 
 NetworkPolicy manifests deny ingress/egress by default, allow DNS, allow Cronos-labelled
 pods to reach its datastores, and allow application HTTPS egress excluding private,
-loopback, link-local, multicast and reserved IPv4 ranges. They need a CNI that enforces
+loopback, link-local, multicast and reserved IPv4 ranges. A separate TCP/8000 rule
+permits only the configured Telegram proxy IP; its credentials stay in `cronos-app`.
+They need a CNI that enforces
 Kubernetes NetworkPolicy; the existence of accepted policies is not evidence of enforcement.
 
 **Live check on 2026-09-05:** the cluster has no running Calico/Cilium agents and its YC

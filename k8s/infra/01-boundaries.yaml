@@ -139,3 +139,8 @@ spec:
               - 240.0.0.0/4
       ports:
         - {protocol: TCP, port: 443}
+    # Authenticated Telegram proxy; credentials are stored only in cronos-app.
+    - to:
+        - ipBlock: {cidr: 91.245.226.35/32}
+      ports:
+        - {protocol: TCP, port: 8000}

@@ -74,7 +74,7 @@ async def test_free_fallback_chain_is_three_attempts_without_sdk_retries():
         models.append(json.loads(request.content)["model"])
         return httpx.Response(503, json={"error": {"message": "unavailable"}})
 
-    p = provider(handler)
+    p = provider(handler, model_free="mistralai/mistral-nemo")
     try:
         with pytest.raises(ProviderError) as exc:
             await p.complete([{"role": "user", "content": "hello"}])
@@ -118,7 +118,7 @@ async def test_tools_route_uses_auto_choice_and_has_one_usage_receipt():
     p = provider(handler)
     try:
         result = await p.complete([{"role": "user", "content": "search"}], tools=[tool])
-        assert requests[0]["model"] == "qwen/qwen3.7-flash"
+        assert requests[0]["model"] == "deepseek/deepseek-v4-flash"
         assert requests[0]["tool_choice"] == "auto"
         assert requests[0]["reasoning"] == {"enabled": False}
         assert result["message"]["tool_calls"][0]["id"] == "call-1"
@@ -151,7 +151,7 @@ async def test_explicit_tools_model_falls_back_to_verified_tools_model(selected)
             ],
             model=selected,
         )
-        assert [body["model"] for body in requests] == [selected, "qwen/qwen3.7-flash"]
+        assert [body["model"] for body in requests] == [selected, p.settings.model_tools]
         assert requests[1]["reasoning"] == {"enabled": False}
         assert requests[1]["tools"] == requests[0]["tools"]
         assert len(result["attempts"]) == 2
@@ -370,7 +370,7 @@ async def test_vision_switches_free_text_model_to_vision_route():
                     ],
                 }
             ],
-            model="mistralai/mistral-nemo",
+            model=p.settings.model_free,
         )
         assert selected == ["qwen/qwen3.7-flash"]
     finally:
