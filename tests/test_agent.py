@@ -1,0 +1,281 @@
+import json
+import os
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+from uuid import uuid4
+
+import asyncpg
+import pytest
+
+from cronos.agent import Agent, CancelledRun, analyze_table
+from cronos.capabilities import SKILLS, TOOLS, catalog_context
+from cronos.settings import Settings
+from cronos.storage import Store
+
+
+def test_table_arithmetic_uses_decimal_and_reports_invalid_rows():
+    extracted = {
+        "tables": [
+            {
+                "columns": ["Сумма"],
+                "rows": [
+                    ["1 200,50"],
+                    ["3.25"],
+                    [None],
+                    ["не число"],
+                    ["NaN"],
+                    ["Infinity"],
+                ],
+            }
+        ]
+    }
+    answer = analyze_table(extracted, {"column": "Сумма", "operation": "sum"})
+    assert answer["value"] == "1203.75"
+    assert answer["numeric_rows"] == 2
+    assert answer["skipped_rows"] == 4
+
+
+@pytest.mark.parametrize(
+    ("operation", "expected"), [("mean", "3"), ("min", "1"), ("max", "5"), ("count", "2")]
+)
+def test_table_dictionary_rows(operation, expected):
+    extracted = {
+        "tables": [
+            {
+                "columns": ["amount"],
+                "rows": [
+                    {"amount": "1"},
+                    {"amount": "5"},
+                    {"amount": "missing"},
+                ],
+            }
+        ]
+    }
+    assert (
+        analyze_table(extracted, {"column": "amount", "operation": operation})["value"] == expected
+    )
+
+
+def test_table_without_extracted_tables_reports_user_error():
+    with pytest.raises(ValueError):
+        analyze_table({"tables": []}, {"column": "0", "operation": "sum"})
+
+
+async def test_advertised_skill_names_are_discoverable_and_unknown_tools_are_denied(tmp_path):
+    agent = Agent(
+        Settings(database_url="postgresql://unused", artifacts_dir=str(tmp_path)),
+        SimpleNamespace(),
+        SimpleNamespace(),
+        SimpleNamespace(),
+    )
+    discovery = next(tool for tool in TOOLS if tool["function"]["name"] == "skill_info")
+    advertised = discovery["function"]["parameters"]["properties"]["skill"]["enum"]
+    assert set(advertised) == set(SKILLS)
+    assert len({tool["function"]["name"] for tool in TOOLS}) == len(TOOLS)
+    for skill in advertised:
+        result = await agent.execute(
+            "skill_info", {"skill": skill}, "unused", {"user_id": -920001}, {}
+        )
+        assert result["summary"] in catalog_context()
+        assert result["instructions"]
+    with pytest.raises(ValueError):
+        await agent.execute(
+            "run_arbitrary_shell", {"command": "true"}, "unused", {"user_id": -920001}, {}
+        )
+
+
+def model_response(content=None, *, tool=None, args=None):
+    message = {"role": "assistant", "content": content}
+    if tool:
+        message["tool_calls"] = [
+            {
+                "id": "call-test",
+                "type": "function",
+                "function": {
+                    "name": tool,
+                    "arguments": json.dumps(args),
+                },
+            }
+        ]
+    return {
+        "message": message,
+        "usage": {
+            "cost_rub": "0.001",
+            "model": "fake/test",
+            "prompt_tokens": 10,
+            "completion_tokens": 5,
+        },
+    }
+
+
+@pytest.fixture
+async def graph_case(request, tmp_path):
+    """Opt-in real database test; all writes are confined to named synthetic users."""
+    if not os.environ.get("DATABASE_URL") or not os.environ.get("ADMIN_DATABASE_URL"):
+        pytest.skip("Real PostgreSQL URLs required; use scripts/run_local.py")
+    user_id = request.param
+    assert -920005 <= user_id <= -920001
+    settings = Settings(artifacts_dir=str(tmp_path))
+    admin = await asyncpg.connect(settings.admin_database_url.get_secret_value(), timeout=10)
+    store = Store(settings)
+    await store.open()
+    event_id = uuid4()
+    created_user = False
+    try:
+        # Do not delete any pre-existing rows: a parallel test must have its own ID.
+        if await admin.fetchval("SELECT 1 FROM users WHERE user_id=$1", user_id):
+            pytest.fail(
+                "Synthetic test user already exists; inspect its unfinished test before rerun"
+            )
+        await store.ensure_user(user_id)
+        created_user = True
+        conversation = await store.conversation(user_id, user_id, 0, "Integration test")
+        await admin.execute("INSERT INTO events(id,payload) VALUES($1,'{}')", event_id)
+        run = await store.start_run(event_id, user_id, conversation["id"])
+        transport = SimpleNamespace(
+            draft=AsyncMock(), bot=SimpleNamespace(answer_callback_query=AsyncMock())
+        )
+        provider = SimpleNamespace(complete=AsyncMock(), search=AsyncMock())
+        agent = Agent(settings, store, provider, transport)
+        yield SimpleNamespace(
+            agent=agent,
+            store=store,
+            admin=admin,
+            run=run,
+            conversation=conversation,
+            provider=provider,
+            user_id=user_id,
+        )
+    finally:
+        try:
+            if created_user:
+                run_ids = await admin.fetch("SELECT id FROM runs WHERE user_id=$1", user_id)
+                if run_ids:
+                    threads = [str(row["id"]) for row in run_ids]
+                    for table in ("checkpoint_writes", "checkpoint_blobs", "checkpoints"):
+                        await admin.execute(
+                            f"DELETE FROM langgraph.{table} WHERE thread_id=ANY($1::text[])",
+                            threads,
+                        )
+                await admin.execute(
+                    "DELETE FROM occurrences WHERE schedule_id IN (SELECT id FROM schedules WHERE user_id=$1)",
+                    user_id,
+                )
+                for table in (
+                    "outbox",
+                    "schedules",
+                    "messages",
+                    "memory",
+                    "operations",
+                    "reservations",
+                    "usage",
+                    "ledger",
+                    "artifacts",
+                    "run_metrics",
+                    "runs",
+                    "conversations",
+                    "users",
+                ):
+                    await admin.execute(f"DELETE FROM {table} WHERE user_id=$1", user_id)
+                await admin.execute("DELETE FROM events WHERE id=$1", event_id)
+        finally:
+            await store.close()
+            await admin.close()
+
+
+@pytest.mark.parametrize("graph_case", [-920001], indirect=True)
+async def test_real_graph_remembers_and_replays_without_recalling_model(graph_case):
+    case = graph_case
+    case.provider.complete.side_effect = [
+        model_response(
+            tool="memory_write",
+            args={"content": "Тестовое предпочтение: чай", "category": "preference"},
+        ),
+        model_response("Запомнил предпочтение."),
+    ]
+    answer = await case.agent.run(case.run, case.conversation, "Запомни, что люблю чай")
+    assert answer == "Запомнил предпочтение."
+    assert case.provider.complete.await_count == 2
+    assert [row["content"] for row in await case.store.memories(case.user_id)] == [
+        "Тестовое предпочтение: чай"
+    ]
+    assert (
+        await case.admin.fetchval(
+            "SELECT count(*) FROM langgraph.checkpoints WHERE thread_id=$1", str(case.run["id"])
+        )
+        > 0
+    )
+    next_run = await case.store.start_run(
+        case.run["event_id"], case.user_id, case.conversation["id"]
+    )
+    assert next_run["fence"] > case.run["fence"]
+    assert await case.agent.run(next_run, case.conversation, "Запомни, что люблю чай") == answer
+    assert case.provider.complete.await_count == 2
+    assert (
+        await case.admin.fetchval(
+            "SELECT count(*) FROM ledger WHERE user_id=$1 AND kind='usage'", case.user_id
+        )
+        == 2
+    )
+
+
+@pytest.mark.parametrize("graph_case", [-920002], indirect=True)
+async def test_real_graph_rejects_stale_fence_before_model_or_checkpoint_write(graph_case):
+    case = graph_case
+    await case.store.start_run(case.run["event_id"], case.user_id, case.conversation["id"])
+    with pytest.raises(CancelledRun):
+        await case.agent.run(case.run, case.conversation, "Нельзя выполнять")
+    case.provider.complete.assert_not_called()
+    assert (
+        await case.admin.fetchval(
+            "SELECT count(*) FROM langgraph.checkpoints WHERE thread_id=$1", str(case.run["id"])
+        )
+        == 0
+    )
+
+
+@pytest.mark.parametrize("graph_case", [-920003], indirect=True)
+async def test_real_graph_cancel_during_model_records_cost_but_does_not_execute_tool(graph_case):
+    case = graph_case
+
+    async def cancel_then_return(*args, **kwargs):
+        await case.admin.execute(
+            "UPDATE runs SET cancel_requested=true WHERE id=$1", case.run["id"]
+        )
+        return model_response(tool="memory_write", args={"content": "must not be saved"})
+
+    case.provider.complete.side_effect = cancel_then_return
+    with pytest.raises(CancelledRun):
+        await case.agent.run(case.run, case.conversation, "Отмени во время модели")
+    assert await case.store.memories(case.user_id) == []
+    assert (
+        await case.admin.fetchval("SELECT cost_micro FROM usage WHERE user_id=$1", case.user_id)
+        == 1000
+    )
+
+
+@pytest.mark.parametrize("graph_case", [-920004], indirect=True)
+async def test_real_graph_search_tool_result_returns_to_model_with_sources(graph_case):
+    case = graph_case
+    case.provider.complete.side_effect = [
+        model_response(tool="web_search", args={"query": "проверочный запрос"}),
+        model_response("Ответ с источником https://example.com/source"),
+    ]
+    case.provider.search.return_value = {
+        "text": "Проверенный результат",
+        "sources": [{"url": "https://example.com/source", "title": "Test"}],
+        "usage": {"model": "fake/search", "cost_rub": "0.002"},
+    }
+    answer = await case.agent.run(case.run, case.conversation, "Найди сведения")
+    assert "https://example.com/source" in answer
+    case.provider.search.assert_awaited_once_with("проверочный запрос")
+    followup = case.provider.complete.call_args_list[1].args[0]
+    tool_message = next(message for message in followup if message["role"] == "tool")
+    assert tool_message["tool_call_id"] == "call-test"
+    assert json.loads(tool_message["content"])["sources"][0]["url"] == "https://example.com/source"
+    assert (
+        await case.admin.fetchval(
+            "SELECT sum(cost_micro) FROM usage WHERE user_id=$1", case.user_id
+        )
+        == 4000
+    )

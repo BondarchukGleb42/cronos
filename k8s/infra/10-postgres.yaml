@@ -1,0 +1,129 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cronos-postgres-init
+  namespace: cronos-bot
+data:
+  10-app-role.sh: |
+    #!/bin/sh
+    set -eu
+    psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" \
+      --set=app_password="$POSTGRES_APP_PASSWORD" <<'SQL'
+    CREATE ROLE cronos_app LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD :'app_password';
+    GRANT CONNECT ON DATABASE cronos TO cronos_app;
+    GRANT USAGE ON SCHEMA public TO cronos_app;
+    ALTER DEFAULT PRIVILEGES FOR ROLE cronos_admin IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO cronos_app;
+    ALTER DEFAULT PRIVILEGES FOR ROLE cronos_admin IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO cronos_app;
+    CREATE SCHEMA langgraph AUTHORIZATION cronos_app;
+    SQL
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: cronos-bot
+spec:
+  selector:
+    app.kubernetes.io/name: postgres
+  ports:
+    - {name: postgres, port: 5432, targetPort: postgres}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: cronos-bot
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgres
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: postgres
+        app.kubernetes.io/part-of: cronos
+        app.kubernetes.io/component: datastore
+    spec:
+      serviceAccountName: cronos-runtime
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 70
+        runAsGroup: 70
+        fsGroup: 70
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: postgres
+          image: postgres:17-alpine@sha256:18cfe3ef5e6815560c98237d6216d1e5119702fb0f3894c8785dd58b8bbe5d73
+          args:
+            - postgres
+            - -c
+            - shared_buffers=64MB
+            - -c
+            - max_connections=40
+            - -c
+            - work_mem=2MB
+            - -c
+            - maintenance_work_mem=32MB
+            - -c
+            - max_wal_size=256MB
+            - -c
+            - min_wal_size=80MB
+          env:
+            - {name: POSTGRES_DB, value: cronos}
+            - {name: POSTGRES_USER, value: cronos_admin}
+            - {name: PGDATA, value: /var/lib/postgresql/data/pgdata}
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: cronos-infra, key: POSTGRES_PASSWORD}
+            - name: POSTGRES_APP_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: cronos-infra, key: POSTGRES_APP_PASSWORD}
+          ports:
+            - {name: postgres, containerPort: 5432}
+          resources:
+            requests: {cpu: 100m, memory: 128Mi, ephemeral-storage: 64Mi}
+            limits: {cpu: 500m, memory: 512Mi, ephemeral-storage: 512Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/postgresql/data}
+            - {name: init, mountPath: /docker-entrypoint-initdb.d, readOnly: true}
+            - {name: socket, mountPath: /var/run/postgresql}
+            - {name: tmp, mountPath: /tmp}
+          startupProbe:
+            exec: {command: [pg_isready, -U, cronos_admin, -d, cronos]}
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 60
+          readinessProbe:
+            exec: {command: [pg_isready, -U, cronos_admin, -d, cronos]}
+            periodSeconds: 10
+            timeoutSeconds: 3
+          livenessProbe:
+            exec: {command: [pg_isready, -U, cronos_admin, -d, cronos]}
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 6
+      volumes:
+        - name: init
+          configMap: {name: cronos-postgres-init, defaultMode: 0555}
+        - name: socket
+          emptyDir: {sizeLimit: 16Mi}
+        - name: tmp
+          emptyDir: {sizeLimit: 64Mi}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        namespace: cronos-bot
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: yc-network-hdd
+        resources:
+          requests: {storage: 5Gi}

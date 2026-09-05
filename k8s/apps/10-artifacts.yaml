@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: cronos-artifacts
+  namespace: cronos-bot
+  labels:
+    app.kubernetes.io/name: cronos-artifacts
+    app.kubernetes.io/part-of: cronos
+    app.kubernetes.io/component: application
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: yc-network-hdd
+  resources:
+    requests:
+      storage: 5Gi

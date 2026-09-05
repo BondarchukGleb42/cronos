@@ -1,0 +1,228 @@
+name: Cronos checks build and deploy
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cronos-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  UV_VERSION: "0.8.22"
+  PYTHON_VERSION: "3.14"
+  CRONOS_IMAGE_REPOSITORY: cr.yandex/crpe8jmbmklfe4l31c68/cronos
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_DB: cronos_test
+          POSTGRES_USER: cronos_admin
+          POSTGRES_PASSWORD: cronos-test-admin-only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U cronos_admin -d cronos_test"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+    env:
+      # Disposable GitHub service credentials; never used by the application cluster.
+      DATABASE_URL: postgresql://cronos_app:cronos-test-app-only@127.0.0.1:5432/cronos_test
+      ADMIN_DATABASE_URL: postgresql://cronos_admin:cronos-test-admin-only@127.0.0.1:5432/cronos_test
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+      - name: Install locked dependencies
+        run: uv sync --locked
+      - name: Prepare test database roles
+        run: |
+          uv run --no-sync python - <<'PY'
+          import asyncio
+          import os
+          import asyncpg
+
+          async def main():
+              connection = await asyncpg.connect(os.environ["ADMIN_DATABASE_URL"])
+              try:
+                  await connection.execute("CREATE ROLE cronos_app LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD 'cronos-test-app-only'")
+                  await connection.execute("CREATE SCHEMA langgraph AUTHORIZATION cronos_app")
+              finally:
+                  await connection.close()
+
+          asyncio.run(main())
+          PY
+      - name: Migrate test database
+        run: uv run --no-sync python -m cronos.storage
+      - name: Install fonts for PDF tests
+        run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends fonts-dejavu-core
+      - name: Ruff
+        run: uv run --no-sync ruff check src tests
+      - name: Type check
+        run: uv run --no-sync ty check src
+      - name: Pytest
+        run: uv run --no-sync pytest -q
+      - uses: azure/setup-kubectl@v4
+        with:
+          version: v1.34.1
+      - name: Validate deployment scope and shell
+        run: |
+          bash -n k8s/apps/deploy.sh
+          kubectl kustomize k8s/apps > "$RUNNER_TEMP/cronos-apps.yaml"
+          uv run --no-sync python - <<'PY'
+          import os
+          from pathlib import Path
+          import yaml
+
+          manifests = list(yaml.safe_load_all(Path(os.environ["RUNNER_TEMP"], "cronos-apps.yaml").read_text()))
+          manifests += list(yaml.safe_load_all(Path("k8s/apps/migration-job.yaml").read_text()))
+          allowed = {"Deployment", "Service", "PersistentVolumeClaim", "Job"}
+          for item in manifests:
+              assert item["kind"] in allowed, item["kind"]
+              assert item["metadata"]["namespace"] == "cronos-bot", item["metadata"]
+              if item["kind"] not in {"Deployment", "Job"}:
+                  continue
+              pod = item["spec"]["template"]["spec"]
+              assert pod["serviceAccountName"] == "cronos-runtime"
+              assert pod["automountServiceAccountToken"] is False
+              assert pod["securityContext"]["runAsUser"] == 10001
+              for container in pod["containers"]:
+                  assert container["securityContext"]["readOnlyRootFilesystem"] is True
+                  assert not container.get("envFrom")
+                  admin_keys = [entry for entry in container.get("env", []) if entry["name"] == "ADMIN_DATABASE_URL"]
+                  assert not admin_keys or item["kind"] == "Job"
+          print(f"Validated {len(manifests)} namespace-scoped application resources")
+          PY
+
+  build:
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v6
+      - name: Login to Yandex Container Registry
+        uses: yc-actions/yc-cr-login@v3
+        with:
+          yc-sa-json-credentials: ${{ secrets.YC_JSON_CREDENTIALS }}
+      - uses: docker/setup-buildx-action@v3
+      - name: Build and push immutable commit tag
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          tags: ${{ env.CRONOS_IMAGE_REPOSITORY }}:${{ github.sha }}
+          cache-from: type=gha,scope=cronos
+          cache-to: type=gha,mode=max,scope=cronos
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - uses: azure/setup-kubectl@v4
+        with:
+          version: v1.34.1
+      - name: Load kubeconfig without logging credentials
+        id: kubeconfig
+        env:
+          CRONOS_KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
+        run: |
+          python - <<'PY'
+          import base64
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+
+          raw = os.environ["CRONOS_KUBE_CONFIG"].strip()
+          if not raw:
+              raise SystemExit("KUBE_CONFIG secret is empty")
+          if "apiVersion:" in raw or raw.startswith("{"):
+              data = raw.encode()
+          else:
+              data = base64.b64decode("".join(raw.split()), validate=True)
+          path = Path(os.environ["RUNNER_TEMP"], "cronos-kubeconfig")
+          path.touch(mode=0o600)
+          path.write_bytes(data)
+          path.chmod(0o600)
+          # Minify to the allowed context without invoking its credential plugin.
+          result = subprocess.run(
+              ["kubectl", "--kubeconfig", str(path), "--context", "yc-gradius", "config", "view", "--minify", "--raw", "-o", "json"],
+              check=True, capture_output=True, text=True,
+          )
+          config = json.loads(result.stdout)
+          user = config["users"][0]["user"]
+          plugin = user.get("exec")
+          needs_token = False
+          if plugin:
+              if Path(plugin["command"]).name != "yc" or "create-token" not in plugin.get("args", []):
+                  raise SystemExit("KUBE_CONFIG uses an unsupported credential plugin; provide a static token or YC credentials")
+              # Replace the laptop-specific YC path/profile with a short-lived CI token.
+              config["users"][0]["user"] = {}
+              needs_token = True
+          path.write_text(json.dumps(config))
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"needs_yc_token={str(needs_token).lower()}\n")
+          with open(os.environ["GITHUB_ENV"], "a") as env:
+              env.write(f"KUBECONFIG={path}\n")
+          PY
+      - name: Issue temporary YC token when kubeconfig uses YC exec
+        if: steps.kubeconfig.outputs.needs_yc_token == 'true'
+        id: yc-token
+        uses: yc-actions/yc-iam-token@v1
+        with:
+          yc-sa-json-credentials: ${{ secrets.YC_JSON_CREDENTIALS }}
+          mask-token: "true"
+      - name: Complete YC kubeconfig authentication
+        if: steps.kubeconfig.outputs.needs_yc_token == 'true'
+        env:
+          CRONOS_IAM_TOKEN: ${{ steps.yc-token.outputs.token }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          token = os.environ["CRONOS_IAM_TOKEN"]
+          if not token:
+              raise SystemExit("YC did not return an IAM token")
+          path = Path(os.environ["KUBECONFIG"])
+          config = json.loads(path.read_text())
+          config["users"][0]["user"] = {"token": token}
+          path.write_text(json.dumps(config))
+          PY
+      - name: Migrate and deploy only cronos-bot
+        env:
+          CRONOS_COMMIT: ${{ github.sha }}
+          CRONOS_MIGRATION_ID: g${{ github.run_id }}-a${{ github.run_attempt }}
+        run: bash k8s/apps/deploy.sh "$CRONOS_COMMIT" "$CRONOS_MIGRATION_ID"
+      - name: Deployment diagnostics
+        if: failure()
+        run: |
+          kubectl --context yc-gradius --namespace cronos-bot get pods,pvc
+          kubectl --context yc-gradius --namespace cronos-bot get events --sort-by=.lastTimestamp
+      - name: Remove temporary credentials
+        if: always()
+        run: rm -f -- "$RUNNER_TEMP/cronos-kubeconfig"

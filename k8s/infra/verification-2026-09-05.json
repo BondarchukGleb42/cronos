@@ -1,0 +1,52 @@
+{
+  "date": "2026-09-05",
+  "context": "yc-gradius",
+  "namespace": "cronos-bot",
+  "ready": [
+    "statefulset/postgres",
+    "statefulset/rabbitmq",
+    "deployment/redis"
+  ],
+  "pvc_bound_gib": {
+    "data-postgres-0": 5,
+    "data-rabbitmq-0": 1
+  },
+  "infra_requests": {
+    "cpu_millicores": 225,
+    "memory_mib": 288
+  },
+  "infra_limits": {
+    "cpu_millicores": 1100,
+    "memory_mib": 1024
+  },
+  "namespace_limits": {
+    "cpu": 4,
+    "memory_gib": 6,
+    "storage_gib": 20
+  },
+  "postgres_version": "17.11",
+  "postgres_application_connection": {
+    "source": "disposable application-labelled probe pod",
+    "endpoint": "postgres:5432/cronos",
+    "role": "cronos_app",
+    "superuser": false,
+    "bypass_rls": false,
+    "result": "passed"
+  },
+  "rabbitmq_diagnostics": "fully booted and running",
+  "redis_readiness": "authenticated PING passed",
+  "runtime_service_account_can_get_secrets": false,
+  "runtime_service_account_can_create_pods": false,
+  "network_policy_enforced": false,
+  "network_policy_probe": "Unlabelled restricted pod with no allow rules connected to Redis TCP and printed NETWORK_POLICY_UNENFORCED.",
+  "network_policy_provider": "No Calico/Cilium pods; YC cluster network_policy metadata null.",
+  "temporary_probe_pods_deleted": true,
+  "cluster_wide_changes": [
+    "Created namespace cronos-bot only"
+  ],
+  "other_namespaces_mutated": false,
+  "secrets_written_to_files_or_logs": false,
+  "images_pinned_to_live_registry_digests": true,
+  "limit_range_rejection_confirmed": true,
+  "pod_security_rejection_confirmed": true
+}

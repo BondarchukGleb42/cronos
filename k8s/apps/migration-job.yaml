@@ -1,0 +1,56 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: cronos-migrate-MIGRATION_ID
+  namespace: cronos-bot
+  labels:
+    app.kubernetes.io/name: cronos-migrate
+    app.kubernetes.io/part-of: cronos
+    app.kubernetes.io/component: application
+spec:
+  ttlSecondsAfterFinished: 3600
+  activeDeadlineSeconds: 300
+  backoffLimit: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cronos-migrate
+        app.kubernetes.io/part-of: cronos
+        app.kubernetes.io/component: application
+    spec:
+      restartPolicy: Never
+      serviceAccountName: cronos-runtime
+      automountServiceAccountToken: false
+      imagePullSecrets:
+        - name: image-pull-secret
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: migrate
+          image: cr.yandex/crpe8jmbmklfe4l31c68/cronos:IMAGE_TAG
+          imagePullPolicy: IfNotPresent
+          command: [python, -m, cronos.storage]
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef: {name: cronos-infra, key: DATABASE_URL}
+            - name: ADMIN_DATABASE_URL
+              valueFrom:
+                secretKeyRef: {name: cronos-infra, key: ADMIN_DATABASE_URL}
+          resources:
+            requests: {cpu: 50m, memory: 128Mi, ephemeral-storage: 32Mi}
+            limits: {cpu: 500m, memory: 512Mi, ephemeral-storage: 128Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          volumeMounts:
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: tmp
+          emptyDir: {sizeLimit: 64Mi}

@@ -1,0 +1,105 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: cronos-gateway
+  namespace: cronos-bot
+  labels:
+    app.kubernetes.io/name: cronos-gateway
+    app.kubernetes.io/part-of: cronos
+    app.kubernetes.io/component: application
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: cronos-gateway
+  ports:
+    - {name: http, port: 8000, targetPort: http}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cronos-gateway
+  namespace: cronos-bot
+  labels:
+    app.kubernetes.io/name: cronos-gateway
+    app.kubernetes.io/part-of: cronos
+    app.kubernetes.io/component: application
+spec:
+  replicas: 1
+  revisionHistoryLimit: 3
+  progressDeadlineSeconds: 600
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cronos-gateway
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cronos-gateway
+        app.kubernetes.io/part-of: cronos
+        app.kubernetes.io/component: application
+    spec:
+      serviceAccountName: cronos-runtime
+      automountServiceAccountToken: false
+      imagePullSecrets:
+        - name: image-pull-secret
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: gateway
+          image: cronos-app
+          imagePullPolicy: IfNotPresent
+          command: [python, -m, cronos.gateway]
+          ports:
+            - {name: http, containerPort: 8000}
+          env:
+            - {name: PORT, value: "8000"}
+            - {name: LOG_LEVEL, value: INFO}
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef: {name: cronos-infra, key: DATABASE_URL}
+            - name: RABBITMQ_URL
+              valueFrom:
+                secretKeyRef: {name: cronos-infra, key: RABBITMQ_URL}
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef: {name: cronos-infra, key: REDIS_URL}
+            - name: TELEGRAM_BOT_TOKEN
+              valueFrom:
+                secretKeyRef: {name: cronos-app, key: TELEGRAM_BOT_TOKEN}
+            - name: TELEGRAM_PROXY
+              valueFrom:
+                secretKeyRef: {name: cronos-app, key: TELEGRAM_PROXY}
+          resources:
+            requests: {cpu: 50m, memory: 96Mi, ephemeral-storage: 32Mi}
+            limits: {cpu: 250m, memory: 256Mi, ephemeral-storage: 128Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          volumeMounts:
+            - {name: tmp, mountPath: /tmp}
+          startupProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 5
+            failureThreshold: 36
+            timeoutSeconds: 3
+          readinessProbe:
+            httpGet: {path: /readyz, port: http}
+            periodSeconds: 10
+            failureThreshold: 3
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 15
+            failureThreshold: 3
+            timeoutSeconds: 3
+      volumes:
+        - name: tmp
+          emptyDir: {sizeLimit: 64Mi}
