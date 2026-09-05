@@ -65,7 +65,7 @@ uv run python -m cronos.storage
 uv run pytest -q
 ```
 
-Без DB-переменных интеграционные тесты явно пропускаются. Для рабочей среды также нужны `TELEGRAM_BOT_TOKEN`, `ALLTOKENS_API_KEY`, `ALLTOKENS_BASE_URL`, `RABBITMQ_URL`, `REDIS_URL`, `ARTIFACTS_DIR`. Секреты передаются окружением, `.env` не читается.
+Без DB-переменных интеграционные тесты явно пропускаются. Для рабочей среды также нужны `TELEGRAM_BOT_TOKEN`, `TELEGRAM_PROXY`, `ALLTOKENS_API_KEY`, `ALLTOKENS_BASE_URL`, `RABBITMQ_URL`, `REDIS_URL`, `ARTIFACTS_DIR`. Секреты передаются окружением, `.env` не читается.
 
 ```sh
 uv run python -m cronos.gateway

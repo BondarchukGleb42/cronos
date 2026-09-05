@@ -10,7 +10,7 @@ ServiceAccount, права доступа, сетевые политики ил�
 | --- | --- | --- | --- |
 | Gateway | `python -m cronos.gateway` | 50m / 250m | 96 / 256 MiB |
 | Worker | `python -m cronos.worker` | 150m / 1000m | 256 / 1536 MiB |
-| Coordinator | `python -m cronos.coordinator` | 25m / 200m | 64 / 192 MiB |
+| Coordinator | `python -m cronos.coordinator` | 25m / 200m | 64 / 256 MiB |
 | Миграция | `python -m cronos.storage` | 50m / 500m | 128 / 512 MiB |
 
 Worker и coordinator работают в двух контейнерах одного pod. Их общий PVC
@@ -21,8 +21,8 @@ Gateway тоже обновляется через `Recreate`, чтобы не �
 сохраненных в PostgreSQL событий и заданий.
 
 Постоянно работающая часть приложения запрашивает 225m CPU / 416 MiB RAM; ее лимиты
-составляют 1450m / 1984 MiB. Вместе с существующей инфраструктурой и одним migration Job:
-500m CPU / 832 MiB RAM запросов, 3050m CPU / 3520 MiB RAM лимитов. Это укладывается в
+составляют 1450m / 2048 MiB. Вместе с существующей инфраструктурой и одним migration Job:
+500m CPU / 832 MiB RAM запросов, 3050m CPU / 3584 MiB RAM лимитов. Это укладывается в
 квоты namespace 2 CPU / 4 GiB для requests и 4 CPU / 6 GiB для limits. Общий объем PVC
 с учетом PostgreSQL и RabbitMQ составляет 11 GiB при квоте 20 GiB.
 
@@ -40,7 +40,7 @@ ServiceAccount `cronos-runtime` и следующие Secrets:
 | --- | --- |
 | `cronos-infra` | `DATABASE_URL`, `RABBITMQ_URL`, `REDIS_URL` |
 | `cronos-infra`, только Job | `ADMIN_DATABASE_URL` |
-| `cronos-app` | `TELEGRAM_BOT_TOKEN`, `ALLTOKENS_API_KEY`, `ALLTOKENS_BASE_URL` |
+| `cronos-app` | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_PROXY`, `ALLTOKENS_API_KEY`, `ALLTOKENS_BASE_URL` |
 | `image-pull-secret` | существующий `kubernetes.io/dockerconfigjson` |
 
 Runtime выбирает конкретные ключи через `secretKeyRef`; целые Secrets через `envFrom`
@@ -53,7 +53,18 @@ Runtime выбирает конкретные ключи через `secretKeyRe
   `crpe8jmbmklfe4l31c68`. Если kubeconfig использует YC exec-аутентификацию, этому же
   аккаунту нужен заранее настроенный доступ к ресурсам приложения в `cronos-bot`.
 - `KUBE_CONFIG`: kubeconfig как YAML/JSON или его base64-представление; в нем должен быть
-  контекст с именем `yc-gradius` и права на ресурсы приложения внутри `cronos-bot`.
+  единственный контекст целевого кластера и права на ресурсы приложения внутри `cronos-bot`.
+  Исходное имя контекста может отличаться от `yc-gradius`.
+
+Загрузчик `.github/scripts/prepare_kubeconfig.py` проверяет endpoint
+`https://158.160.206.91` и SHA-256 DER-сертификата CA
+`ed33146e7c913bb47bca091df5b63fd9c686a6937e76034e0d509d5a830ad914`, подтвержденные для
+кластера `yc-managed-k8s-cat6962jnmiet6712ov1`. CA должен быть встроен через
+`certificate-authority-data`. Единственный подходящий контекст переименовывается в
+`yc-gradius`; исходный current-context не влияет на выбор. Неизвестный endpoint, другой
+CA, отключенная TLS-проверка или несколько подходящих контекстов останавливают deploy.
+При смене endpoint или CA сначала проверьте кластер и обновите pins загрузчика.
+Диагностика загрузки выводит только имена контекстов и endpoints; учетные данные не выводятся.
 
 Значения Secrets не включаются в образ, исходники, аргументы команд или журналы workflow.
 Временный kubeconfig имеет права `0600` и удаляется после deploy job.

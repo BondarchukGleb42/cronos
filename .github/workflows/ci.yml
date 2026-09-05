@@ -78,6 +78,10 @@ jobs:
         run: uv run --no-sync ty check src
       - name: Pytest
         run: uv run --no-sync pytest -q
+      - name: Check kubeconfig selection with sanitized fixtures
+        run: |
+          uv run --no-sync ruff check .github/scripts .github/tests
+          uv run --no-sync python -m unittest discover -s .github/tests -v
       - uses: azure/setup-kubectl@v4
         with:
           version: v1.34.1
@@ -199,46 +203,7 @@ jobs:
         id: kubeconfig
         env:
           CRONOS_KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
-        run: |
-          python - <<'PY'
-          import base64
-          import json
-          import os
-          import subprocess
-          from pathlib import Path
-
-          raw = os.environ["CRONOS_KUBE_CONFIG"].strip()
-          if not raw:
-              raise SystemExit("KUBE_CONFIG secret is empty")
-          if "apiVersion:" in raw or raw.startswith("{"):
-              data = raw.encode()
-          else:
-              data = base64.b64decode("".join(raw.split()), validate=True)
-          path = Path(os.environ["RUNNER_TEMP"], "cronos-kubeconfig")
-          path.touch(mode=0o600)
-          path.write_bytes(data)
-          path.chmod(0o600)
-          # Minify to the allowed context without invoking its credential plugin.
-          result = subprocess.run(
-              ["kubectl", "--kubeconfig", str(path), "--context", "yc-gradius", "config", "view", "--minify", "--raw", "-o", "json"],
-              check=True, capture_output=True, text=True,
-          )
-          config = json.loads(result.stdout)
-          user = config["users"][0]["user"]
-          plugin = user.get("exec")
-          needs_token = False
-          if plugin:
-              if Path(plugin["command"]).name != "yc" or "create-token" not in plugin.get("args", []):
-                  raise SystemExit("KUBE_CONFIG uses an unsupported credential plugin; provide a static token or YC credentials")
-              # Replace the laptop-specific YC path/profile with a short-lived CI token.
-              config["users"][0]["user"] = {}
-              needs_token = True
-          path.write_text(json.dumps(config))
-          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
-              output.write(f"needs_yc_token={str(needs_token).lower()}\n")
-          with open(os.environ["GITHUB_ENV"], "a") as env:
-              env.write(f"KUBECONFIG={path}\n")
-          PY
+        run: python .github/scripts/prepare_kubeconfig.py
       - name: Issue temporary YC token when kubeconfig uses YC exec
         if: steps.kubeconfig.outputs.needs_yc_token == 'true'
         id: yc-token
@@ -270,7 +235,7 @@ jobs:
           CRONOS_MIGRATION_ID: g${{ github.run_id }}-a${{ github.run_attempt }}
         run: bash k8s/apps/deploy.sh "$CRONOS_COMMIT" "$CRONOS_MIGRATION_ID"
       - name: Deployment diagnostics
-        if: failure()
+        if: failure() && steps.kubeconfig.outcome == 'success'
         run: |
           kubectl --context yc-gradius --namespace cronos-bot get pods,pvc
           kubectl --context yc-gradius --namespace cronos-bot get events --sort-by=.lastTimestamp
