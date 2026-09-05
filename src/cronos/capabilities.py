@@ -151,14 +151,21 @@ TOOLS = [
     ),
     tool(
         "file_create",
-        "Создать и отправить документ или таблицу.",
+        "Создать и отправить документ или таблицу. Для CSV/XLSX передавай columns и rows. Сохраняй язык, названия колонок и значения точно по запросу пользователя, не переводи их.",
         {
             "format": string(enum=["pdf", "xlsx", "csv", "docx", "txt"]),
             "filename": string(),
-            "content": string(),
-            "columns": {"type": "array", "items": string()},
+            "content": string(
+                "Текст документа; при заполненных columns и rows можно передать пустую строку. Для CSV также допустим готовый CSV-текст с разделителями, без Markdown."
+            ),
+            "columns": {
+                "type": "array",
+                "items": string(),
+                "description": "Названия колонок в порядке и на языке пользователя, без перевода.",
+            },
             "rows": {
                 "type": "array",
+                "description": "Строки ячеек в том же порядке, что columns. Числа передавай числами; текстовые значения сохраняй без перевода.",
                 "items": {
                     "type": "array",
                     "items": {"type": ["string", "number", "boolean", "null"]},

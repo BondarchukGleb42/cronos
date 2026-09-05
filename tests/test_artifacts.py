@@ -98,6 +98,52 @@ def test_csv_roundtrip_handles_unicode_numbers_quotes_and_formula_injection(mana
     assert artifact["extracted"]["tables"][0]["rows"] == rows[1:]
 
 
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        (
+            "Product,Price\nApple,120\nPear,90",
+            [["Product", "Price"], ["Apple", "120"], ["Pear", "90"]],
+        ),
+        (
+            '\ufeffПродукт;Цена\n"Яблоко, красное";120\n"Груша\nспелая";90',
+            [["Продукт", "Цена"], ["Яблоко, красное", "120"], ["Груша\nспелая", "90"]],
+        ),
+    ],
+)
+def test_csv_content_is_parsed_into_cells_and_read_back_from_disk(manager, content, expected):
+    # The live model supplied the first payload without columns/rows.
+    artifact = manager.generate(42, "csv", "products.csv", content)
+    with Path(artifact["path"]).open(encoding="utf-8-sig", newline="") as stream:
+        assert list(csv.reader(stream)) == expected
+    actual = manager.read(42, artifact["path"])["tables"][0]
+    assert actual["columns"] == expected[0] and actual["rows"] == expected[1:]
+    assert artifact["extracted"]["tables"][0] == actual
+
+
+def test_csv_content_still_escapes_formula_cells(manager):
+    artifact = manager.generate(42, "csv", "formula.csv", 'Item,Formula\nsafe,"=SUM(1,2)"')
+    assert manager.read(42, artifact["path"])["tables"][0]["rows"] == [["safe", "'=SUM(1,2)"]]
+
+
+def test_csv_explicit_cells_take_precedence_over_document_content(manager):
+    artifact = manager.generate(
+        42,
+        "csv",
+        "products.csv",
+        "Ignored,content",
+        ["Продукт", "Цена"],
+        [["Яблоко", 120], ["Груша", 90]],
+    )
+    assert manager.read(42, artifact["path"])["tables"][0]["columns"] == ["Продукт", "Цена"]
+
+
+def test_malformed_csv_content_is_rejected_without_creating_an_artifact(manager):
+    with pytest.raises(ValueError, match="Некорректный CSV"):
+        manager.generate(42, "csv", "invalid.csv", 'Product,Price\n"unterminated,120')
+    assert list((manager.root / "42").iterdir()) == []
+
+
 def test_windows_csv_is_detected_and_utf16_text_is_read(manager):
     artifact = manager.ingest(
         42, "экспорт.csv", "Товар;Цена\nМолоко;90\nХлеб;45\n".encode("cp1251")

@@ -87,17 +87,21 @@ def _table_text(table: dict) -> str:
     return "\n".join("\t".join(_display(value) for value in row) for row in rows)
 
 
+def _csv_records(text: str, *, strict: bool = False) -> list[list[str]]:
+    try:
+        dialect = csv.Sniffer().sniff(text[:65536], delimiters=",;\t|")
+    except csv.Error:
+        dialect = csv.excel
+    return list(csv.reader(io.StringIO(text, newline=""), dialect=dialect, strict=strict))
+
+
 def _extract(data: bytes, suffix: str) -> dict:
     if suffix in {".txt", ".md"}:
         text, encoding = _decode(data)
         return {**_preview(text), "encoding": encoding}
     if suffix == ".csv":
         text, encoding = _decode(data)
-        try:
-            dialect = csv.Sniffer().sniff(text[:65536], delimiters=",;\t|")
-        except csv.Error:
-            dialect = csv.excel
-        records = list(csv.reader(io.StringIO(text, newline=""), dialect=dialect))
+        records = _csv_records(text)
         table = {"name": "CSV", "columns": records[0] if records else [], "rows": records[1:]}
         return {**_preview(text), "encoding": encoding, "tables": [table]}
     if suffix == ".xlsx":
@@ -536,7 +540,12 @@ class ArtifactManager:
             writer = csv.writer(stream)
             records = ([columns] if columns else []) + rows
             if not records:
-                records = [[line] for line in content.splitlines()] or [[content]]
+                try:
+                    records = _csv_records(content.removeprefix("\ufeff"), strict=True) or [[""]]
+                except csv.Error as error:
+                    raise ValueError(
+                        "Некорректный CSV: передайте columns и rows или корректный CSV в content"
+                    ) from error
             writer.writerows([_csv_value(value) for value in row] for row in records)
             data = stream.getvalue().encode("utf-8-sig")
         elif format == "txt":

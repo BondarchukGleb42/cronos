@@ -11,6 +11,7 @@ from uuid import uuid4
 import aio_pika
 
 from cronos.agent import Agent, CancelledRun, setup_checkpoints
+from cronos.lifecycle import cancel_tasks, close_all, run_until_stopped
 from cronos.logging import configure_logging
 from cronos.providers import Provider, ProviderError
 from cronos.settings import get_settings
@@ -322,20 +323,25 @@ class Worker:
                 await asyncio.sleep(5)
 
     async def run(self):
-        await self.store.open()
-        await setup_checkpoints(self.settings)
+        tasks = []
         try:
-            await asyncio.gather(self.recovery(), self.consume(), self.health())
+            await self.store.open()
+            await setup_checkpoints(self.settings)
+            tasks = [
+                asyncio.create_task(self.recovery()),
+                asyncio.create_task(self.consume()),
+                asyncio.create_task(self.health()),
+            ]
+            await asyncio.gather(*tasks)
         finally:
-            await self.provider.close()
-            await self.transport.close()
-            await self.store.close()
+            await cancel_tasks(tasks)
+            await close_all(self.provider.close, self.transport.close, self.store.close)
 
 
 def main():
     settings = get_settings()
     configure_logging(settings.log_level)
-    asyncio.run(Worker(settings).run())
+    asyncio.run(run_until_stopped(Worker(settings).run()))
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@ from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, Teleg
 from redis.asyncio import Redis
 
 from cronos.billing import Reconciler
+from cronos.lifecycle import cancel_tasks, close_all, run_until_stopped
 from cronos.logging import configure_logging
 from cronos.settings import get_settings
 from cronos.storage import Store, uid
@@ -193,10 +194,10 @@ class Coordinator:
             await asyncio.sleep(15)
 
     async def run(self):
-        await self.store.open()
-        health = asyncio.create_task(self.health())
-        reconciliation = asyncio.create_task(self.reconcile())
+        tasks = []
         try:
+            await self.store.open()
+            tasks = [asyncio.create_task(self.health()), asyncio.create_task(self.reconcile())]
             while True:
                 try:
                     await self.store.schedule_due()
@@ -209,26 +210,17 @@ class Coordinator:
                     log.exception("Coordinator tick failed")
                 await asyncio.sleep(1)
         finally:
-            health.cancel()
-            reconciliation.cancel()
-            from contextlib import suppress
-
-            with suppress(asyncio.CancelledError):
-                await health
-            with suppress(asyncio.CancelledError):
-                await reconciliation
-            await self.reconciler.close()
+            await cancel_tasks(tasks)
+            closers = [self.reconciler.close]
             if self.connection:
-                await self.connection.close()
-            await self.redis.aclose()
-            await self.transport.close()
-            await self.store.close()
+                closers.append(self.connection.close)
+            await close_all(*closers, self.redis.aclose, self.transport.close, self.store.close)
 
 
 def main():
     settings = get_settings()
     configure_logging(settings.log_level)
-    asyncio.run(Coordinator(settings).run())
+    asyncio.run(run_until_stopped(Coordinator(settings).run()))
 
 
 if __name__ == "__main__":

@@ -163,6 +163,17 @@ def public_logs(logs):
         cost = str(row.get("cost_rub", ""))
         if re.fullmatch(r"\d+(?:\.\d+)?", cost):
             item["cost_rub"] = cost
+        checks = row.get("checks", {})
+        if isinstance(checks, dict):
+            item["checks"] = {
+                key: value
+                for key, value in checks.items()
+                if key in {
+                    "memory_persisted", "stored_facts", "search_sources",
+                    "csv_readback_rows", "csv_metadata_matches",
+                }
+                and isinstance(value, (bool, int))
+            }
         scenarios[scenario] = item
     return {
         "pass_marker": "LIVE_AGENT_SMOKE_PASS" in logs.splitlines(),
