@@ -12,9 +12,16 @@ from cronos.storage import Store
 USER = -930001
 
 
+class SmokeStore(Store):
+    async def enqueue_for_run(self, run, conversation, payload, dedupe_key):
+        # Exercise real tools without exposing a synthetic delivery to the sender.
+        assert run["user_id"] == USER
+        return -1
+
+
 async def main():
     settings = get_settings().model_copy(update={"max_output_tokens": 1024})
-    store = Store(settings)
+    store = SmokeStore(settings)
     provider = Provider(settings)
     await store.open()
     await setup_checkpoints(settings)
@@ -29,6 +36,7 @@ async def main():
     preview = Preview()
     async with store.connection(USER) as conn:
         await conn.execute("DELETE FROM memory WHERE user_id=$1", USER)
+        await conn.execute("DELETE FROM artifacts WHERE user_id=$1", USER)
     agent = Agent(settings, store, provider, preview)
     results = []
     try:

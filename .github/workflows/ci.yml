@@ -115,14 +115,28 @@ jobs:
     needs: checks
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    outputs:
+      published: ${{ steps.result.outputs.published }}
     steps:
       - uses: actions/checkout@v6
+      - name: Select image publication mode
+        id: mode
+        env:
+          CRONOS_REGISTRY_CREDENTIALS: ${{ secrets.YC_JSON_CREDENTIALS }}
+        run: |
+          if [[ -n "$CRONOS_REGISTRY_CREDENTIALS" ]]; then
+            echo "registry_available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "registry_available=false" >> "$GITHUB_OUTPUT"
+          fi
       - name: Login to Yandex Container Registry
+        if: steps.mode.outputs.registry_available == 'true'
         uses: yc-actions/yc-cr-login@v3
         with:
           yc-sa-json-credentials: ${{ secrets.YC_JSON_CREDENTIALS }}
       - uses: docker/setup-buildx-action@v3
       - name: Build and push immutable commit tag
+        if: steps.mode.outputs.registry_available == 'true'
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -133,9 +147,44 @@ jobs:
           tags: ${{ env.CRONOS_IMAGE_REPOSITORY }}:${{ github.sha }}
           cache-from: type=gha,scope=cronos
           cache-to: type=gha,mode=max,scope=cronos
+      - name: Build image archive without registry credentials
+        if: steps.mode.outputs.registry_available != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: false
+          provenance: false
+          tags: ${{ env.CRONOS_IMAGE_REPOSITORY }}:${{ github.sha }}
+          outputs: type=docker,dest=${{ runner.temp }}/cronos-image.tar
+          cache-from: type=gha,scope=cronos
+          cache-to: type=gha,mode=max,scope=cronos
+      - name: Upload image archive for manual publication
+        if: steps.mode.outputs.registry_available != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: cronos-image-${{ github.sha }}
+          path: ${{ runner.temp }}/cronos-image.tar
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+      - name: Report image publication result
+        id: result
+        env:
+          CRONOS_PUBLISHED: ${{ steps.mode.outputs.registry_available }}
+          CRONOS_COMMIT: ${{ github.sha }}
+        run: |
+          echo "published=$CRONOS_PUBLISHED" >> "$GITHUB_OUTPUT"
+          if [[ "$CRONOS_PUBLISHED" == "true" ]]; then
+            echo "Image published: $CRONOS_IMAGE_REPOSITORY:$CRONOS_COMMIT" | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Artifact only: cronos-image-$CRONOS_COMMIT (retained for 1 day). Registry publication and deployment were skipped." | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
 
   deploy:
     needs: build
+    if: needs.build.outputs.published == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:

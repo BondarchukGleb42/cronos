@@ -47,7 +47,7 @@ Runtime выбирает конкретные ключи через `secretKeyRe
 не импортируются. Доступ администратора PostgreSQL есть только у migration Job.
 Инициализация LangGraph checkpoints выполняется worker при запуске под прикладной ролью.
 
-В GitHub Actions нужны репозиторные Secrets:
+Для автоматической публикации и развертывания в GitHub Actions нужны репозиторные Secrets:
 
 - `YC_JSON_CREDENTIALS`: JSON авторизованного ключа, имеющего доступ на push в registry
   `crpe8jmbmklfe4l31c68`. Если kubeconfig использует YC exec-аутентификацию, этому же
@@ -83,7 +83,16 @@ Dockerfile устанавливает зависимости по `uv.lock` с u
 а в runtime устанавливает `fonts-dejavu-core` для кириллицы в PDF. Образ один для всех
 трех процессов и миграции. Тег `latest` не используется.
 
-Далее workflow:
+Если `YC_JSON_CREDENTIALS` отсутствует, проверки и сборка все равно выполняются.
+Workflow экспортирует образ с тем же полным SHA-тегом в `cronos-image.tar` и сохраняет
+GitHub Artifact `cronos-image-<полный SHA коммита>` на один день без дополнительного сжатия.
+В summary явно указан режим `Artifact only`, выход build job `published=false`, а deploy
+job пропускается. Это готовый образ для ручного скачивания и публикации, а не выполненный
+deploy. После публикации этого SHA можно запустить `k8s/apps/deploy.sh`, как описано ниже.
+Если credentials заданы, но вход в registry или push завершился ошибкой, workflow падает
+и не выдает результат за успешную публикацию.
+
+При успешной публикации образа (`published=true`) workflow:
 
 1. Проверяет существование требуемых сервисов и Secrets без чтения их значений в журнал.
 2. Проверяет сгенерированные манифесты через server-side dry run.
