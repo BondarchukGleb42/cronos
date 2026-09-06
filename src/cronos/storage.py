@@ -683,7 +683,7 @@ class Store:
                 "INSERT INTO operations(id,user_id,run_id,kind,result,status) VALUES($1,$2,$3,$4,$5,'done') ON CONFLICT(id) DO NOTHING",
                 operation_id,
                 user_id,
-                uid(run_id),
+                uid(run_id) if run_id is not None else None,
                 kind,
                 result,
             )

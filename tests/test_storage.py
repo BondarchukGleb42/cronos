@@ -4,6 +4,8 @@ import asyncio
 import json
 import os
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import asyncpg
@@ -13,6 +15,7 @@ from dateutil.relativedelta import relativedelta
 
 from cronos.settings import Settings
 from cronos.storage import PLANS, Store, uid
+from cronos.topics import create_chat
 
 A, B = -910001, -910002
 pytestmark = pytest.mark.asyncio(loop_scope="module")
@@ -85,6 +88,67 @@ async def make_run(store, user_id=A, event_id=None, thread=1):
             {"test_user_id": user_id},
         )
     return await store.start_run(event_id, user_id, conversation["id"]), conversation
+
+
+async def test_runless_operation_persists_and_replays_original_result(store):
+    operation_id = "test-runless-topic-create"
+    result = {"thread_id": 42, "name": "Новый чат"}
+    await store.save_operation(operation_id, A, None, "topic_create", result)
+    assert await store.operation(operation_id) == result
+    await store.save_operation(
+        operation_id, A, None, "topic_create", {"thread_id": 99, "name": "Duplicate"}
+    )
+    assert await store.operation(operation_id) == result
+    async with store.connection() as conn:
+        rows = await conn.fetch(
+            "SELECT user_id,run_id,kind,status,result FROM operations WHERE id=$1", operation_id
+        )
+    assert [dict(row) for row in rows] == [
+        {"user_id": A, "run_id": None, "kind": "topic_create", "status": "done", "result": result}
+    ]
+
+
+async def test_create_chat_with_real_store_persists_topic_result_and_deduplicates_welcome(store):
+    operation_id = "test-real-topic-create"
+    topic = {"message_thread_id": 42, "name": "Новый чат"}
+    transport = SimpleNamespace(
+        topic_capabilities=AsyncMock(return_value=SimpleNamespace(has_topics_enabled=True)),
+        create_topic=AsyncMock(return_value=topic),
+    )
+    result = await create_chat(store, transport, A, A, operation_id)
+    assert result["thread_id"] == 42 and result["name"] == "Новый чат"
+    assert await store.operation(operation_id) == {"thread_id": 42, "name": "Новый чат"}
+
+    replay = await create_chat(store, transport, A, A, operation_id)
+    assert replay == result
+    transport.topic_capabilities.assert_awaited_once()
+    transport.create_topic.assert_awaited_once_with(A, "Новый чат")
+    async with store.connection(A) as conn:
+        conversations = await conn.fetch("SELECT * FROM conversations WHERE user_id=$1", A)
+        operations = await conn.fetch(
+            "SELECT id,run_id,kind,status FROM operations WHERE user_id=$1 ORDER BY id", A
+        )
+        deliveries = await conn.fetch("SELECT * FROM outbox WHERE user_id=$1", A)
+    assert len(conversations) == 1
+    assert str(conversations[0]["id"]) == result["id"]
+    assert conversations[0]["chat_id"] == A and conversations[0]["thread_id"] == 42
+    assert conversations[0]["title"] == "Новый чат"
+    assert [dict(row) for row in operations] == [
+        {"id": operation_id, "run_id": None, "kind": "topic_create", "status": "done"},
+        {
+            "id": operation_id + ":intent",
+            "run_id": None,
+            "kind": "topic_intent",
+            "status": "started",
+        },
+    ]
+    assert len(deliveries) == 1
+    delivery = deliveries[0]
+    assert delivery["chat_id"] == A and delivery["thread_id"] == 42
+    assert delivery["state"] == "pending"
+    assert delivery["dedupe_key"] == f"topic-welcome:{A}:42"
+    assert "Новый чат готов" in delivery["payload"]["text"]
+    assert delivery["payload"]["reply_markup"]["inline_keyboard"]
 
 
 async def test_rls_is_enforced_for_two_users_and_transaction_settings_do_not_leak(store):
