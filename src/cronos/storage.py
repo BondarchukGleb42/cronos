@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
-from uuid import UUID, uuid4
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import asyncpg
 from dateutil.relativedelta import relativedelta
@@ -261,6 +261,158 @@ class Store:
                 )
             ]
 
+    async def _topic_title_state(self, conn, user_id: int, conversation_id):
+        conversation = await conn.fetchrow(
+            "SELECT * FROM conversations WHERE user_id=$1 AND id=$2 FOR UPDATE",
+            user_id,
+            uid(conversation_id),
+        )
+        if not conversation or not conversation["title_auto"] or conversation["thread_id"] <= 0:
+            return None
+        counts = await conn.fetchrow(
+            """SELECT count(*) AS total, bool_or(role='user') AS has_user,
+            bool_or(role='assistant') AS has_assistant FROM messages
+            WHERE user_id=$1 AND conversation_id=$2 AND NOT excluded
+            AND role IN ('user','assistant')""",
+            user_id,
+            conversation["id"],
+        )
+        count = counts["total"]
+        if count < 2 or not counts["has_user"] or not counts["has_assistant"]:
+            return None
+        milestone = max(2, count // 10 * 10)
+        previous = conversation["title_message_count"]
+        if previous >= milestone:
+            return None
+        return {"conversation": dict(conversation), "message_count": count, "threshold": milestone}
+
+    async def queue_topic_title(self, user_id: int, conversation_id) -> bool:
+        async with self.connection(user_id) as conn:
+            context = await self._topic_title_state(conn, user_id, conversation_id)
+            if context is None:
+                return False
+            conversation = context["conversation"]
+            dedupe = (
+                f"cronos:topic_title:{user_id}:{conversation['id']}:"
+                f"{conversation['revision']}:{context['threshold']}"
+            )
+            return bool(
+                await conn.fetchval(
+                    """INSERT INTO events(id,kind,payload) VALUES($1,'topic_title',$2)
+                    ON CONFLICT(id) DO NOTHING RETURNING id""",
+                    uuid5(NAMESPACE_URL, dedupe),
+                    {
+                        "user_id": user_id,
+                        "conversation_id": str(conversation["id"]),
+                        "revision": conversation["revision"],
+                        "threshold": context["threshold"],
+                    },
+                )
+            )
+
+    async def topic_title_context(self, user_id: int, conversation_id) -> dict | None:
+        async with self.connection(user_id) as conn:
+            context = await self._topic_title_state(conn, user_id, conversation_id)
+            if context is None:
+                return None
+            rows = await conn.fetch(
+                """SELECT role,content FROM messages
+                WHERE user_id=$1 AND conversation_id=$2 AND NOT excluded
+                AND role IN ('user','assistant') ORDER BY id DESC LIMIT 12""",
+                user_id,
+                context["conversation"]["id"],
+            )
+            return {
+                "conversation": context["conversation"],
+                "messages": [dict(row) for row in reversed(rows)],
+                "message_count": context["message_count"],
+            }
+
+    async def set_topic_title(
+        self, user_id: int, conversation_id, title: str, message_count: int, revision: int
+    ) -> bool:
+        if message_count < 2 or not title.strip():
+            return False
+        async with self.connection(user_id) as conn:
+            return bool(
+                await conn.fetchval(
+                    """UPDATE conversations SET title=$3,title_message_count=$4
+                    WHERE user_id=$1 AND id=$2 AND title_auto AND thread_id>0 AND revision=$5
+                    AND title_message_count<GREATEST(2,($4::integer/10)*10)
+                    RETURNING id""",
+                    user_id,
+                    uid(conversation_id),
+                    title.strip(),
+                    message_count,
+                    revision,
+                )
+            )
+
+    async def sync_topic_title(
+        self,
+        user_id: int,
+        chat_id: int,
+        thread_id: int,
+        title: str,
+        manual: bool = False,
+        created: bool = False,
+        update_id: int = 0,
+    ) -> dict | None:
+        """Sync service events; update_id is the chat's monotonic service message_id.
+
+        Creation only initializes missing topics. Older manual events return None;
+        repeating the latest event returns its row for a safe Telegram API retry.
+        """
+        if thread_id <= 0:
+            return None
+        await self.ensure_user(user_id)
+        async with self.connection(user_id) as conn:
+            row = await conn.fetchrow(
+                """INSERT INTO conversations
+                (id,user_id,chat_id,thread_id,title,title_auto,revision,title_update_id)
+                VALUES($1,$2,$3,$4,$5,NOT $6::boolean,CASE WHEN $6 THEN 1 ELSE 0 END,
+                    CASE WHEN $6 AND $7::bigint>0 THEN $7 ELSE 0 END)
+                ON CONFLICT(user_id,chat_id,thread_id) DO NOTHING RETURNING *""",
+                uuid4(),
+                user_id,
+                chat_id,
+                thread_id,
+                title,
+                manual,
+                update_id,
+            )
+            if row is not None:
+                return dict(row)
+            row = await conn.fetchrow(
+                """SELECT * FROM conversations WHERE user_id=$1 AND chat_id=$2
+                AND thread_id=$3 FOR UPDATE""",
+                user_id,
+                chat_id,
+                thread_id,
+            )
+            if created:
+                return dict(row)
+            if manual and update_id > 0:
+                if update_id < row["title_update_id"]:
+                    return None
+                if update_id == row["title_update_id"]:
+                    return dict(row)
+            row = await conn.fetchrow(
+                """UPDATE conversations SET
+                title=CASE WHEN $4 OR title_auto THEN $3 ELSE title END,
+                title_auto=CASE WHEN $4 THEN false ELSE title_auto END,
+                revision=revision+CASE WHEN $4 AND
+                    (title_auto OR title IS DISTINCT FROM $3) THEN 1 ELSE 0 END,
+                title_update_id=CASE WHEN $4 AND $5::bigint>0 THEN $5 ELSE title_update_id END
+                WHERE user_id=$1 AND id=$2 RETURNING *""",
+                user_id,
+                row["id"],
+                title,
+                manual,
+                update_id,
+            )
+            return dict(row)
+
     async def history(self, user_id: int, conversation_id, limit: int = 30):
         async with self.connection(user_id) as conn:
             rows = await conn.fetch(
@@ -316,9 +468,29 @@ class Store:
             )
             # Rotating all active context prevents facts returning through a checkpoint or paraphrase.
             await conn.execute("UPDATE messages SET excluded=true WHERE user_id=$1", user_id)
-            await conn.execute(
-                "UPDATE conversations SET revision=revision+1 WHERE user_id=$1", user_id
+            conversations = await conn.fetch(
+                """UPDATE conversations SET revision=revision+1,title_message_count=0,
+                title=CASE WHEN title_auto AND thread_id>0 THEN 'Новый чат' ELSE title END
+                WHERE user_id=$1 RETURNING id,revision,thread_id,title_auto""",
+                user_id,
             )
+            for conversation in conversations:
+                if not conversation["title_auto"] or conversation["thread_id"] <= 0:
+                    continue
+                dedupe = (
+                    f"cronos:topic_title_reset:{user_id}:{conversation['id']}:"
+                    f"{conversation['revision']}"
+                )
+                await conn.execute(
+                    """INSERT INTO events(id,kind,payload) VALUES($1,'topic_title_reset',$2)
+                    ON CONFLICT(id) DO NOTHING""",
+                    uuid5(NAMESPACE_URL, dedupe),
+                    {
+                        "user_id": user_id,
+                        "conversation_id": str(conversation["id"]),
+                        "revision": conversation["revision"],
+                    },
+                )
             await conn.execute(
                 "UPDATE users SET memory_revision=memory_revision+1 WHERE user_id=$1", user_id
             )

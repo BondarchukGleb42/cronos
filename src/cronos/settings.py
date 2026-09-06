@@ -22,6 +22,7 @@ class Settings(BaseSettings):
     model_reasoning: str = "deepseek/deepseek-v4-flash"
     model_search: str = "perplexity/sonar"
     model_image: str = "google/gemini-3.1-flash-image-preview"
+    model_title: str = "meta-llama/llama-3.1-8b-instruct"
     model_fallbacks: str = "meta-llama/llama-3.1-8b-instruct,inclusionai/ling-3.0-flash"
     alpha_soft_limits: bool = True
     max_model_steps: int = Field(default=8, ge=1, le=24)

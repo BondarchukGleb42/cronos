@@ -8,6 +8,7 @@ from uuid import uuid4
 
 import uvicorn
 from aiogram import Bot
+from aiogram.types import BotCommand, BotCommandScopeAllPrivateChats
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
@@ -81,6 +82,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         transport = TelegramTransport(config)
         try:
             await store.open()
+            try:
+                await transport.bot.set_my_commands(
+                    [
+                        BotCommand(command=command, description=description)
+                        for command, description in (
+                            ("new", "Новый чат"),
+                            ("chats", "Мои чаты"),
+                            ("stop", "Остановить ответ"),
+                            ("plans", "Тестовые тарифы"),
+                            ("start", "Начать общение"),
+                        )
+                    ],
+                    scope=BotCommandScopeAllPrivateChats(),
+                    request_timeout=10,
+                )
+            except Exception as exc:
+                logger.warning("Telegram commands setup retry on restart: %s", type(exc).__name__)
             app.state.store = store
             app.state.last_poll_success = 0.0
             task = asyncio.create_task(

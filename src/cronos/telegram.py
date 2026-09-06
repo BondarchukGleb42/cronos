@@ -1,7 +1,10 @@
 """Telegram delivery and a deliberately small, safe Markdown renderer."""
 
+import asyncio
 import logging
 import re
+import time
+from dataclasses import dataclass
 from typing import Any, TypedDict
 from urllib.parse import urlsplit
 
@@ -15,6 +18,14 @@ from cronos.settings import Settings
 
 logger = logging.getLogger(__name__)
 _INLINE = re.compile(r"(`[^`\n]+`|\*\*[^*\n]+\*\*|\|\|[^|\n]+\|\||\[[^\]\n]+\]\([^\s)]+\))")
+_TOPIC_CAPABILITIES_TTL = 60.0
+
+
+@dataclass(frozen=True)
+class TopicCapabilities:
+    has_topics_enabled: bool
+    allows_users_to_create_topics: bool
+    username: str | None
 
 
 class _Destination(TypedDict):
@@ -41,6 +52,32 @@ def upgrade_keyboard() -> dict:
             for plan in ("START", "PREMIUM", "PRO")
         ]
     }
+
+
+def new_chat_keyboard() -> dict:
+    return {"inline_keyboard": [[{"text": "➕ Новый чат", "callback_data": "chat:new"}]]}
+
+
+def chat_navigation_keyboard(bot_username: str | None = None) -> dict:
+    """Open the bot itself; topic selection stays in Telegram's native topic list.
+
+    https://core.telegram.org/api/links#forum-topic-links only documents
+    group/channel message links, not a private-bot topic navigation URL.
+    """
+    keyboard = new_chat_keyboard()
+    username = (bot_username or "").strip().removeprefix("@")
+    if re.fullmatch(r"[A-Za-z0-9_]{5,32}", username):
+        keyboard["inline_keyboard"].append(
+            [{"text": "Открыть Cronos", "url": f"https://t.me/{username}"}]
+        )
+    return keyboard
+
+
+def _topic_name(name: str) -> str:
+    # MTProto additionally limits the title to 128 UTF-8 bytes.
+    return (
+        " ".join(name.split()).encode("utf-8")[:128].decode("utf-8", errors="ignore") or "Новый чат"
+    )
 
 
 def split_text(text: str, limit: int = 3900) -> list[str]:
@@ -230,9 +267,36 @@ class TelegramTransport:
         except ValueError, TypeError, RuntimeError:
             raise ValueError("TELEGRAM_PROXY could not be configured") from None
         self.bot = Bot(settings.telegram_bot_token.get_secret_value(), session=session)
+        self._topic_capabilities: TopicCapabilities | None = None
+        self._topic_capabilities_checked_at = 0.0
+        self._topic_capabilities_lock = asyncio.Lock()
 
     async def close(self):
         await self.bot.session.close()
+
+    async def topic_capabilities(self, force_refresh: bool = False) -> TopicCapabilities:
+        """Cache successful getMe results briefly so BotFather changes can take effect.
+
+        User-side topic creation is independent of the bot's ability to create
+        topics. API failures propagate instead of masquerading as disabled mode.
+        """
+        async with self._topic_capabilities_lock:
+            if (
+                not force_refresh
+                and self._topic_capabilities is not None
+                and time.monotonic() - self._topic_capabilities_checked_at < _TOPIC_CAPABILITIES_TTL
+            ):
+                return self._topic_capabilities
+            me = await self.bot.get_me()
+            capabilities = TopicCapabilities(
+                has_topics_enabled=getattr(me, "has_topics_enabled", None) is True,
+                allows_users_to_create_topics=getattr(me, "allows_users_to_create_topics", None)
+                is True,
+                username=getattr(me, "username", None),
+            )
+            self._topic_capabilities = capabilities
+            self._topic_capabilities_checked_at = time.monotonic()
+            return capabilities
 
     async def send(self, chat_id: int, thread_id: int | None, payload: dict) -> list[int]:
         destination: _Destination = {"chat_id": chat_id, "message_thread_id": thread_id or None}
@@ -341,7 +405,18 @@ class TelegramTransport:
             logger.debug("Telegram draft unavailable")
 
     async def create_topic(self, chat_id: int, name: str) -> dict:
-        topic = await self.bot.create_forum_topic(
-            chat_id=chat_id, name=name.strip()[:128] or "Новый чат"
-        )
+        topic = await self.bot.create_forum_topic(chat_id=chat_id, name=_topic_name(name))
         return topic.model_dump(mode="json", by_alias=True, exclude_none=True)
+
+    async def edit_topic(self, chat_id: int, thread_id: int, name: str) -> bool:
+        if thread_id <= 0:
+            raise ValueError("A positive Telegram topic ID is required")
+        try:
+            return await self.bot.edit_forum_topic(
+                chat_id=chat_id, message_thread_id=thread_id, name=_topic_name(name)
+            )
+        except TelegramBadRequest as exc:
+            # Renaming a topic to its current name is an already-applied retry.
+            if "TOPIC_NOT_MODIFIED" in exc.message.upper():
+                return True
+            raise

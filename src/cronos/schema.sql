@@ -20,6 +20,9 @@ CREATE TABLE IF NOT EXISTS conversations (
   thread_id bigint NOT NULL DEFAULT 0, title text NOT NULL DEFAULT '', revision integer NOT NULL DEFAULT 0,
   created_at timestamptz NOT NULL DEFAULT now(), UNIQUE(user_id,chat_id,thread_id)
 );
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS title_auto boolean NOT NULL DEFAULT true;
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS title_message_count integer NOT NULL DEFAULT 0;
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS title_update_id bigint NOT NULL DEFAULT 0;
 CREATE TABLE IF NOT EXISTS messages (
   id bigserial PRIMARY KEY, user_id bigint NOT NULL REFERENCES users(user_id),
   conversation_id uuid NOT NULL REFERENCES conversations(id), role text NOT NULL,

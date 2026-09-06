@@ -23,6 +23,7 @@ from cronos.file_text import text_window
 from cronos.providers import Provider, ProviderError
 from cronos.settings import Settings
 from cronos.storage import Store
+from cronos.topics import create_chat
 
 
 class CancelledRun(RuntimeError):
@@ -467,22 +468,15 @@ class Agent:
         if name == "topics_list":
             return await self.store.list_conversations(user)
         if name == "topic_create":
-            async with self.store.connection() as conn:
-                inserted = await conn.fetchval(
-                    "INSERT INTO operations(id,user_id,run_id,kind,status) VALUES($1,$2,$3,'topic_intent','started') ON CONFLICT DO NOTHING RETURNING id",
-                    op + ":intent",
-                    user,
-                    run["id"],
-                )
-            if not inserted:
-                return {
-                    "error": "Результат предыдущего создания темы не подтверждён. Проверь список тем; автоматический повтор отключён."
-                }
-            topic = await self.transport.create_topic(conversation["chat_id"], args["name"])
-            new = await self.store.conversation(
-                user, conversation["chat_id"], topic["message_thread_id"], args["name"]
+            return await create_chat(
+                self.store,
+                self.transport,
+                user,
+                conversation["chat_id"],
+                op + ":topic",
+                args["name"],
+                creation_scope=f"run:{run['id']}",
             )
-            return {"id": str(new["id"]), "name": args["name"], "thread_id": new["thread_id"]}
         if name == "models_list":
             models = await self.provider.catalog()
             query = args.get("query", "").casefold()

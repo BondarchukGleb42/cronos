@@ -1,6 +1,7 @@
 """Real PostgreSQL tests; every user-owned write is limited to the two IDs below."""
 
 import asyncio
+import json
 import os
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
@@ -44,7 +45,8 @@ async def cleanup(store):
                     WHERE s.user_id={user_id}) selected;
                 DELETE FROM occurrences WHERE schedule_id IN (SELECT id FROM schedules WHERE user_id={user_id});
                 {deletes}
-                DELETE FROM events WHERE id=ANY(ids) OR payload->>'test_user_id'='{user_id}';
+                DELETE FROM events WHERE id=ANY(ids) OR payload->>'test_user_id'='{user_id}'
+                    OR (kind IN ('topic_title','topic_title_reset') AND payload->>'user_id'='{user_id}');
                 END $$""")
 
 
@@ -147,6 +149,248 @@ async def test_outbox_cannot_target_other_users_conversation(store):
     run, _ = await make_run(store)
     foreign = await store.conversation(B, B, 1)
     assert await store.enqueue_for_run(run, foreign, {"text": "wrong user"}, "cross-user") is None
+
+
+async def title_messages(store, conversation, start, stop):
+    for index in range(start, stop):
+        await store.add_message(
+            conversation["user_id"],
+            conversation["id"],
+            "user" if index % 2 == 0 else "assistant",
+            f"message {index}",
+        )
+
+
+async def test_topic_title_milestones_are_durable_deduplicated_and_coalesce_latest_context(store):
+    conversation = await store.conversation(A, A, 7)
+    assert await store.queue_topic_title(A, conversation["id"]) is False
+    await title_messages(store, conversation, 0, 1)
+    assert await store.topic_title_context(A, conversation["id"]) is None
+    await title_messages(store, conversation, 1, 2)
+    attempts = await asyncio.gather(
+        *(store.queue_topic_title(A, conversation["id"]) for _ in range(6))
+    )
+    assert sum(attempts) == 1
+    context = await store.topic_title_context(A, conversation["id"])
+    assert context["message_count"] == 2
+    assert context["conversation"]["title_auto"] is True
+    assert context["conversation"]["title_message_count"] == 0
+    assert await store.set_topic_title(A, conversation["id"], "Первая тема", 2, 0)
+    assert await store.topic_title_context(A, conversation["id"]) is None
+    assert await store.queue_topic_title(A, conversation["id"]) is False
+
+    await title_messages(store, conversation, 2, 9)
+    assert await store.queue_topic_title(A, conversation["id"]) is False
+    await title_messages(store, conversation, 9, 10)
+    assert await store.queue_topic_title(A, conversation["id"])
+    await title_messages(store, conversation, 10, 19)
+    assert await store.queue_topic_title(A, conversation["id"]) is False
+    context = await store.topic_title_context(A, conversation["id"])
+    assert context["message_count"] == 19
+    assert await store.set_topic_title(A, conversation["id"], "Развившаяся тема", 19, 0)
+    assert await store.topic_title_context(A, conversation["id"]) is None
+    # A delayed first/bucket-10 job cannot replace a newer result in the same revision.
+    assert await store.set_topic_title(A, conversation["id"], "Устаревшая тема", 2, 0) is False
+    assert await store.set_topic_title(A, conversation["id"], "Старый порог", 10, 0) is False
+    await title_messages(store, conversation, 19, 20)
+    assert await store.queue_topic_title(A, conversation["id"])
+    async with store.connection(A) as conn:
+        events = await conn.fetch(
+            "SELECT payload FROM events WHERE kind='topic_title' AND payload->>'conversation_id'=$1",
+            str(conversation["id"]),
+        )
+    assert sorted(event["payload"]["threshold"] for event in events) == [2, 10, 20]
+    assert all(event["payload"]["revision"] == 0 for event in events)
+    assert all(event["payload"]["user_id"] == A for event in events)
+
+
+async def test_topic_title_requires_user_and_assistant_pair_and_ignores_main_chat(store):
+    conversation = await store.conversation(A, A, 3)
+    await store.add_message(A, conversation["id"], "user", "one")
+    await store.add_message(A, conversation["id"], "user", "two")
+    await store.add_message(A, conversation["id"], "tool", "not an assistant answer")
+    assert await store.topic_title_context(A, conversation["id"]) is None
+    assert await store.queue_topic_title(A, conversation["id"]) is False
+    await store.add_message(A, conversation["id"], "assistant", "answer")
+    assert (await store.topic_title_context(A, conversation["id"]))["message_count"] == 3
+    assert await store.queue_topic_title(A, conversation["id"])
+    main = await store.conversation(A, A, 0, "Основной чат")
+    await title_messages(store, main, 0, 12)
+    assert await store.topic_title_context(A, main["id"]) is None
+    assert await store.queue_topic_title(A, main["id"]) is False
+    assert await store.set_topic_title(A, main["id"], "Changed", 12, 0) is False
+    assert await store.sync_topic_title(A, A, 0, "Changed", manual=True) is None
+    assert (await store.conversation(A, A, 0))["title"] == "Основной чат"
+
+
+async def test_topic_title_context_excludes_hidden_tool_system_and_foreign_messages(store):
+    conversation = await store.conversation(A, A, 1)
+    foreign = await store.conversation(B, B, 1)
+    await title_messages(store, conversation, 0, 14)
+    await store.add_message(A, conversation["id"], "system", "system secret")
+    await store.add_message(A, conversation["id"], "tool", "tool secret")
+    await store.add_message(A, conversation["id"], "user", "forgotten", "excluded-title-test")
+    await store.add_message(B, foreign["id"], "user", "foreign secret")
+    async with store.connection(A) as conn:
+        await conn.execute(
+            "UPDATE messages SET excluded=true WHERE source_key='excluded-title-test'"
+        )
+    context = await store.topic_title_context(A, conversation["id"])
+    assert context["message_count"] == 14
+    assert [message["content"] for message in context["messages"]] == [
+        f"message {index}" for index in range(2, 14)
+    ]
+    assert await store.topic_title_context(A, foreign["id"]) is None
+    assert await store.queue_topic_title(A, foreign["id"]) is False
+    assert await store.set_topic_title(A, foreign["id"], "Cross-owner title", 2, 0) is False
+    assert (await store.conversation(B, B, 1))["title"] == ""
+
+
+async def test_manual_topic_title_disables_automation_and_fences_old_work_and_echoes(store):
+    conversation = await store.sync_topic_title(A, A, 1, "Новый чат")
+    assert conversation["title_auto"] is True and conversation["revision"] == 0
+    await title_messages(store, conversation, 0, 2)
+    assert await store.queue_topic_title(A, conversation["id"])
+    context = await store.topic_title_context(A, conversation["id"])
+    manual = await store.sync_topic_title(A, A, 1, "Мой проект", manual=True)
+    assert manual["title_auto"] is False
+    assert manual["revision"] == context["conversation"]["revision"] + 1
+    assert await store.topic_title_context(A, conversation["id"]) is None
+    assert await store.queue_topic_title(A, conversation["id"]) is False
+    assert await store.set_topic_title(A, conversation["id"], "Old generation", 2, 0) is False
+    assert await store.set_topic_title(A, conversation["id"], "Wrongly enabled", 2, 1) is False
+    repeated = await store.sync_topic_title(A, A, 1, "Мой проект", manual=True)
+    assert repeated["revision"] == manual["revision"]
+    echoed = await store.sync_topic_title(A, A, 1, "Old bot service event")
+    assert echoed["title"] == "Мой проект" and echoed["title_auto"] is False
+    renamed = await store.sync_topic_title(A, A, 1, "Новое ручное имя", manual=True)
+    assert renamed["revision"] == manual["revision"] + 1
+
+
+async def test_topic_creation_replay_preserves_generated_title_and_next_milestone(store):
+    conversation = await store.sync_topic_title(A, A, 1, "Новый чат", created=True)
+    await title_messages(store, conversation, 0, 2)
+    assert await store.set_topic_title(A, conversation["id"], "Рабочий план", 2, 0)
+    generated = await store.conversation(A, A, 1)
+    replayed = await store.sync_topic_title(A, A, 1, "Новый чат", created=True)
+    assert replayed == generated
+    assert replayed["title"] == "Рабочий план"
+    assert replayed["title_message_count"] == 2 and replayed["title_auto"] is True
+    assert await store.topic_title_context(A, conversation["id"]) is None
+    await title_messages(store, conversation, 2, 10)
+    assert await store.queue_topic_title(A, conversation["id"])
+    assert (await store.topic_title_context(A, conversation["id"]))["message_count"] == 10
+
+
+async def test_manual_topic_events_reject_older_retries_but_allow_latest_api_retry(store):
+    conversation = await store.conversation(A, A, 1)
+    first = await store.sync_topic_title(A, A, 1, "План A", manual=True, update_id=100)
+    assert first["title_update_id"] == 100 and first["revision"] == 1
+    retry = await store.sync_topic_title(A, A, 1, "План A", manual=True, update_id=100)
+    assert retry == first
+    assert (
+        await store.sync_topic_title(
+            A, A, 1, "Changed duplicate payload", manual=True, update_id=100
+        )
+        == first
+    )
+
+    latest = await store.sync_topic_title(A, A, 1, "План B", manual=True, update_id=101)
+    assert latest["title"] == "План B" and latest["revision"] == 2
+    assert latest["title_update_id"] == 101 and latest["title_auto"] is False
+    assert await store.sync_topic_title(A, A, 1, "План A", manual=True, update_id=100) is None
+    assert await store.conversation(A, A, 1) == latest
+    assert await store.sync_topic_title(A, A, 1, "План B", manual=True, update_id=101) == latest
+    assert await store.set_topic_title(A, conversation["id"], "Stale auto title", 2, 0) is False
+
+    # A later identical name still advances ordering, without changing the revision.
+    advanced = await store.sync_topic_title(A, A, 1, "План B", manual=True, update_id=102)
+    assert advanced["title_update_id"] == 102 and advanced["revision"] == 2
+    assert await store.sync_topic_title(A, A, 1, "План B", manual=True, update_id=101) is None
+    assert (
+        await store.sync_topic_title(
+            A, A, 1, "Creation replay", manual=True, created=True, update_id=99
+        )
+        == advanced
+    )
+
+
+async def test_manual_topic_event_ordering_is_scoped_to_owner_chat_and_thread(store):
+    first = await store.sync_topic_title(A, A, 1, "Мой проект", manual=True, update_id=500)
+    other_thread = await store.sync_topic_title(A, A, 2, "Другая тема", manual=True, update_id=1)
+    other_chat = await store.sync_topic_title(A, 123456, 1, "Другой чат", manual=True, update_id=1)
+    other_owner = await store.sync_topic_title(B, B, 1, "Чужая тема", manual=True, update_id=1)
+    assert [row["title_update_id"] for row in (other_thread, other_chat, other_owner)] == [1, 1, 1]
+    assert await store.sync_topic_title(A, A, 1, "Старое имя", manual=True, update_id=499) is None
+    assert await store.conversation(A, A, 1) == first
+    assert await store.conversation(B, B, 1) == other_owner
+
+
+async def test_explicit_manual_creation_only_initializes_missing_topic(store):
+    created = await store.sync_topic_title(
+        A, A, 1, "Мой проект", manual=True, created=True, update_id=7
+    )
+    assert created["title"] == "Мой проект"
+    assert created["title_auto"] is False and created["revision"] == 1
+    assert created["title_update_id"] == 7
+    renamed = await store.sync_topic_title(A, A, 1, "Новый проект", manual=True)
+    replayed = await store.sync_topic_title(A, A, 1, "Мой проект", manual=True, created=True)
+    assert replayed == renamed
+
+    existing = await store.conversation(A, A, 2)
+    replayed = await store.sync_topic_title(A, A, 2, "Старое имя", manual=True, created=True)
+    assert replayed == existing
+
+
+async def test_forget_resets_only_auto_topic_names_and_durably_queues_safe_resets(store):
+    automatic = await store.conversation(A, A, 1, "Секретное автоназвание")
+    manual = await store.sync_topic_title(A, A, 2, "Ручное название", manual=True)
+    main = await store.conversation(A, A, 0, "Главный чат")
+    foreign = await store.conversation(B, B, 1, "Чужая тема")
+    await title_messages(store, automatic, 0, 2)
+    assert await store.queue_topic_title(A, automatic["id"])
+    assert await store.set_topic_title(A, automatic["id"], "Секретное автоназвание", 2, 0)
+    await store.remember(A, "забываемый факт")
+    result = await store.forget(A, "забываемый")
+    assert result == {"forgotten": ["забываемый факт"], "context_reset": True}
+    reset = await store.conversation(A, A, 1)
+    assert reset["title"] == "Новый чат"
+    assert reset["title_auto"] is True and reset["title_message_count"] == 0
+    assert reset["revision"] == automatic["revision"] + 1
+    unchanged_manual = await store.conversation(A, A, 2)
+    assert unchanged_manual["title"] == manual["title"]
+    assert unchanged_manual["title_auto"] is False
+    assert unchanged_manual["revision"] == manual["revision"] + 1
+    assert (await store.conversation(A, A, 0))["title"] == main["title"]
+    assert await store.conversation(B, B, 1) == foreign
+    assert await store.topic_title_context(A, automatic["id"]) is None
+    assert await store.queue_topic_title(A, automatic["id"]) is False
+    assert await store.set_topic_title(A, automatic["id"], "Stale secret", 2, 0) is False
+    async with store.connection(A) as conn:
+        events = await conn.fetch(
+            "SELECT payload FROM events WHERE kind='topic_title_reset' AND payload->>'user_id'=$1",
+            str(A),
+        )
+    assert [event["payload"] for event in events] == [
+        {
+            "user_id": A,
+            "conversation_id": str(automatic["id"]),
+            "revision": reset["revision"],
+        }
+    ]
+    assert "Секретное" not in json.dumps([dict(event) for event in events], ensure_ascii=False)
+    await title_messages(store, automatic, 2, 4)
+    assert await store.queue_topic_title(A, automatic["id"])
+    fresh_context = await store.topic_title_context(A, automatic["id"])
+    assert fresh_context["message_count"] == 2
+    assert await store.set_topic_title(A, automatic["id"], "Новая тема", 2, reset["revision"])
+    async with store.connection(A) as conn:
+        payloads = await conn.fetch(
+            "SELECT payload FROM events WHERE kind='topic_title' AND payload->>'conversation_id'=$1",
+            str(automatic["id"]),
+        )
+    assert len(payloads) == 2
+    assert {row["payload"]["revision"] for row in payloads} == {0, 1}
 
 
 async def test_user_lock_serializes_topics_and_waiters_leave_pool_capacity(store):

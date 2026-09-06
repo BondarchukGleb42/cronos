@@ -7,6 +7,7 @@ import pytest
 
 from cronos.agent import CancelledRun
 from cronos.providers import ProviderError
+from cronos.telegram import new_chat_keyboard
 from cronos.worker import Worker
 
 
@@ -21,6 +22,7 @@ def worker_case():
         enqueue_for_run=AsyncMock(return_value=1),
         ensure_user=AsyncMock(return_value={"memory_revision": 0}),
         add_message=AsyncMock(),
+        queue_topic_title=AsyncMock(),
         finish_run=AsyncMock(),
         run_metrics=AsyncMock(),
     )
@@ -36,7 +38,11 @@ async def test_completed_answer_has_durable_final_message_after_ephemeral_previe
         -920005, 3, "Сейчас разберусь…", case.run["id"].int % 2_000_000_000 + 1
     )
     args = case.worker.store.enqueue_for_run.call_args.args
-    assert args[2] == {"text": "Готовый ответ", "format": "rich"}
+    assert args[2] == {
+        "text": "Готовый ответ",
+        "format": "rich",
+        "reply_markup": new_chat_keyboard(),
+    }
     assert args[3] == f"answer:{case.event['id']}"
     case.worker.store.finish_run.assert_awaited_once_with(case.run["id"], "done", fence=2)
 

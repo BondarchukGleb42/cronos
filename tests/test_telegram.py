@@ -1,10 +1,11 @@
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
-from aiogram.methods import SendRichMessage
+from aiogram.methods import EditForumTopic, SendRichMessage
 from aiogram.types import FSInputFile, Update
 from aiohttp import TCPConnector
 from aiohttp_socks import ProxyConnectionError as AiohttpProxyConnectionError
@@ -16,6 +17,8 @@ from cronos.settings import Settings
 from cronos.telegram import (
     PartialDeliveryError,
     TelegramTransport,
+    chat_navigation_keyboard,
+    new_chat_keyboard,
     rich_message,
     split_text,
     upgrade_keyboard,
@@ -36,6 +39,17 @@ def transport():
         send_document=AsyncMock(return_value=SimpleNamespace(message_id=13)),
         send_photo=AsyncMock(return_value=SimpleNamespace(message_id=14)),
         send_message_draft=AsyncMock(),
+        get_me=AsyncMock(
+            return_value=SimpleNamespace(
+                username="cronos_ait_bot",
+                has_topics_enabled=True,
+                allows_users_to_create_topics=False,
+            )
+        ),
+        create_forum_topic=AsyncMock(
+            return_value=SimpleNamespace(model_dump=lambda **kwargs: {"message_thread_id": 77})
+        ),
+        edit_forum_topic=AsyncMock(return_value=True),
     )
     return result
 
@@ -188,10 +202,18 @@ async def test_all_telegram_operations_share_the_configured_proxy_session(monkey
 
     async def request(session, bot, method, **kwargs):
         seen.append((session, method.__api_method__))
+        if method.__api_method__ == "getMe":
+            return SimpleNamespace(
+                username="cronos_ait_bot",
+                has_topics_enabled=True,
+                allows_users_to_create_topics=True,
+            )
         if method.__api_method__ == "getUpdates":
             return []
         if method.__api_method__ == "createForumTopic":
             return SimpleNamespace(model_dump=lambda **kwargs: {"message_thread_id": 77})
+        if method.__api_method__ == "editForumTopic":
+            return True
         return SimpleNamespace(message_id=11)
 
     async def stream(session, url, **kwargs):
@@ -212,7 +234,7 @@ async def test_all_telegram_operations_share_the_configured_proxy_session(monkey
         assert isinstance(session, AiohttpSession)
         assert session.proxy == "socks5://proxy.example:1080"
         assert session._connector_init["rdns"] is True
-        await value.bot.get_me()
+        assert (await value.topic_capabilities()).has_topics_enabled is True
         await value.bot.get_updates()
         await value.bot.get_file("file-id")
         await value.bot.download_file("documents/file.pdf")
@@ -220,6 +242,7 @@ async def test_all_telegram_operations_share_the_configured_proxy_session(monkey
         await value.send(1, None, {"text": "table", "format": "rich"})
         await value.draft(1, None, "thinking", 5)
         assert await value.create_topic(1, "topic") == {"message_thread_id": 77}
+        assert await value.edit_topic(1, 77, "renamed") is True
         await value.bot.answer_callback_query("callback-id")
         assert {method for _, method in seen} == {
             "getMe",
@@ -229,6 +252,7 @@ async def test_all_telegram_operations_share_the_configured_proxy_session(monkey
             "sendRichMessage",
             "sendMessageDraft",
             "createForumTopic",
+            "editForumTopic",
             "answerCallbackQuery",
         }
         assert all(actual is session for actual, _ in seen)
@@ -262,3 +286,95 @@ async def test_proxy_failure_on_draft_does_not_create_permanent_or_direct_fallba
     transport.bot.send_message_draft.side_effect = AiohttpProxyConnectionError("proxy unavailable")
     await transport.draft(1, 8, "ищу", 23)
     transport.bot.send_message.assert_not_called()
+
+
+async def test_topic_capabilities_cache_coalesces_reads_and_distinguishes_user_permission(
+    transport,
+):
+    results = await asyncio.gather(*(transport.topic_capabilities() for _ in range(5)))
+    transport.bot.get_me.assert_awaited_once()
+    assert all(result is results[0] for result in results)
+    assert results[0].has_topics_enabled is True
+    assert results[0].allows_users_to_create_topics is False
+    assert results[0].username == "cronos_ait_bot"
+    # Disallowing users to create topics in BotFather does not disable bot creation.
+    assert await transport.create_topic(1, "Работа") == {"message_thread_id": 77}
+
+
+async def test_topic_capabilities_refresh_and_expiration_notice_botfather_changes(
+    transport, monkeypatch
+):
+    clock = Mock(return_value=10.0)
+    monkeypatch.setattr("cronos.telegram.time", SimpleNamespace(monotonic=clock))
+    assert (await transport.topic_capabilities()).has_topics_enabled is True
+    transport.bot.get_me.return_value = SimpleNamespace(username="cronos_ait_bot")
+    assert (await transport.topic_capabilities()).has_topics_enabled is True
+    clock.return_value = 71.0
+    expired = await transport.topic_capabilities()
+    assert expired.has_topics_enabled is False
+    assert expired.allows_users_to_create_topics is False
+    transport.bot.get_me.return_value.has_topics_enabled = True
+    assert (await transport.topic_capabilities(force_refresh=True)).has_topics_enabled is True
+    assert transport.bot.get_me.await_count == 3
+
+
+async def test_topic_capabilities_failure_is_not_cached_as_disabled(transport):
+    transport.bot.get_me.side_effect = AiohttpProxyConnectionError("proxy unavailable")
+    with pytest.raises(AiohttpProxyConnectionError):
+        await transport.topic_capabilities()
+    transport.bot.get_me.side_effect = None
+    assert (await transport.topic_capabilities()).has_topics_enabled is True
+    assert transport.bot.get_me.await_count == 2
+
+
+async def test_edit_topic_preserves_destination_and_unicode_title(transport):
+    name = "  Работа\n" + "😀" * 60
+    assert await transport.edit_topic(42, 77, name) is True
+    call = transport.bot.edit_forum_topic.call_args.kwargs
+    assert call["chat_id"] == 42
+    assert call["message_thread_id"] == 77
+    assert call["name"].startswith("Работа 😀")
+    assert "\n" not in call["name"]
+    assert len(call["name"].encode("utf-8")) <= 128
+    await transport.create_topic(42, name)
+    assert transport.bot.create_forum_topic.call_args.kwargs["name"] == call["name"]
+
+
+async def test_edit_topic_retry_is_idempotent_but_other_api_errors_propagate(transport):
+    method = EditForumTopic(chat_id=42, message_thread_id=77, name="Работа")
+    transport.bot.edit_forum_topic.side_effect = TelegramBadRequest(
+        method=method, message="Bad Request: TOPIC_NOT_MODIFIED"
+    )
+    assert await transport.edit_topic(42, 77, "Работа") is True
+    transport.bot.edit_forum_topic.side_effect = TelegramBadRequest(
+        method=method, message="Bad Request: TOPIC_ID_INVALID"
+    )
+    with pytest.raises(TelegramBadRequest):
+        await transport.edit_topic(42, 77, "Работа")
+
+
+@pytest.mark.parametrize("thread_id", [0, -1])
+async def test_edit_topic_rejects_invalid_thread_before_api_call(transport, thread_id):
+    with pytest.raises(ValueError, match="positive"):
+        await transport.edit_topic(42, thread_id, "Работа")
+    transport.bot.edit_forum_topic.assert_not_called()
+
+
+def test_chat_keyboard_uses_creation_callback_and_honest_bot_link():
+    assert new_chat_keyboard() == {
+        "inline_keyboard": [[{"text": "➕ Новый чат", "callback_data": "chat:new"}]]
+    }
+    keyboard = chat_navigation_keyboard("@cronos_ait_bot")
+    assert keyboard["inline_keyboard"] == [
+        [{"text": "➕ Новый чат", "callback_data": "chat:new"}],
+        [{"text": "Открыть Cronos", "url": "https://t.me/cronos_ait_bot"}],
+    ]
+    assert chat_navigation_keyboard() == new_chat_keyboard()
+    # No unverified private-topic URL or simulated topic-switch callback.
+    assert "chat:switch" not in str(keyboard)
+    assert "thread=" not in str(keyboard)
+
+
+@pytest.mark.parametrize("username", ["x", "https://evil.example", "cronos_bot?start=inject"])
+def test_chat_keyboard_omits_invalid_username_links(username):
+    assert chat_navigation_keyboard(username) == new_chat_keyboard()

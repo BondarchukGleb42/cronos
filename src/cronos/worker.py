@@ -16,7 +16,8 @@ from cronos.logging import configure_logging
 from cronos.providers import Provider, ProviderError
 from cronos.settings import get_settings
 from cronos.storage import STOP_COMMANDS, Store, message_command
-from cronos.telegram import TelegramTransport, upgrade_keyboard
+from cronos.telegram import TelegramTransport, new_chat_keyboard, upgrade_keyboard
+from cronos.topics import TOPICS_UNAVAILABLE, create_chat, welcome_topic
 
 log = logging.getLogger(__name__)
 
@@ -45,6 +46,8 @@ class Worker:
             try:
                 if event["kind"] == "timer":
                     await self.timer(event)
+                elif event["kind"] in {"topic_title", "topic_title_reset"}:
+                    await self.topic_title(event)
                 else:
                     await self.telegram(event)
                 await self.store.finish_event(event["id"], self.owner)
@@ -62,7 +65,50 @@ class Worker:
         message = update.get("message") or (callback or {}).get("message")
         if not message:
             return
+        if message.get("chat", {}).get("type") != "private":
+            return
         sender = (callback or message).get("from", {})
+        created = message.get("forum_topic_created")
+        edited = message.get("forum_topic_edited")
+        if created or edited:
+            # Service updates describe this user's private chat even when the actor is our bot.
+            user_id = message["chat"]["id"]
+            thread_id = message.get("message_thread_id", 0)
+            async with self.store.user_lock(user_id):
+                if created:
+                    topic_conversation = await self.store.sync_topic_title(
+                        user_id,
+                        user_id,
+                        thread_id,
+                        created.get("name", "Новый чат"),
+                        manual=not sender.get("is_bot")
+                        and not created.get("is_name_implicit", False),
+                        created=True,
+                    )
+                    if topic_conversation:
+                        await welcome_topic(
+                            self.store,
+                            user_id,
+                            user_id,
+                            thread_id,
+                            title_auto=topic_conversation["title_auto"],
+                        )
+                elif edited and "name" in edited and not sender.get("is_bot"):
+                    topic_conversation = await self.store.sync_topic_title(
+                        user_id,
+                        user_id,
+                        thread_id,
+                        edited["name"],
+                        manual=True,
+                        update_id=message.get("message_id", 0),
+                    )
+                    # A title job may have completed while this service update was queued.
+                    # Restore the explicit user choice in Telegram as well as in our metadata.
+                    if topic_conversation:
+                        await self.transport.edit_topic(
+                            user_id, thread_id, topic_conversation["title"]
+                        )
+            return
         user_id = sender.get("id")
         if not user_id or sender.get("is_bot") or message.get("chat", {}).get("type") != "private":
             return
@@ -71,6 +117,13 @@ class Worker:
             conversation = await self.store.conversation(user_id, chat_id, thread_id)
             if callback:
                 data = callback.get("data", "")
+                if data == "chat:new":
+                    with suppress(Exception):
+                        await self.transport.bot.answer_callback_query(
+                            callback["id"], text="Создаю новый чат…"
+                        )
+                    await self.new_chat(event, conversation)
+                    return
                 if data.startswith("plan:"):
                     balance = await self.store.change_plan(
                         user_id, data.split(":", 1)[1], f"callback:{callback['id']}"
@@ -91,6 +144,29 @@ class Worker:
                 return
             text = message.get("text") or message.get("caption") or ""
             command = message_command(text)
+            if command == "/new":
+                await self.new_chat(event, conversation)
+                return
+            if command == "/chats":
+                capabilities = await self.transport.topic_capabilities()
+                if capabilities.has_topics_enabled:
+                    chats = await self.store.list_conversations(user_id)
+                    names = [c["title"] or "Новый чат" for c in chats if c["thread_id"] > 0]
+                    text = (
+                        "Все чаты доступны в списке тем Telegram. Выбери тему, чтобы продолжить её."
+                    )
+                    if names:
+                        text += "\n\n" + "\n".join(f"• {name}" for name in names[:30])
+                else:
+                    text = TOPICS_UNAVAILABLE
+                await self.store.enqueue(
+                    user_id,
+                    chat_id,
+                    thread_id,
+                    {"text": text, "reply_markup": new_chat_keyboard()},
+                    f"chats:{event['id']}",
+                )
+                return
             if command in STOP_COMMANDS:
                 await self.store.enqueue(
                     user_id,
@@ -173,6 +249,86 @@ class Worker:
                 return
             await self.answer(event, conversation, text)
 
+    async def new_chat(self, event, conversation):
+        result = await create_chat(
+            self.store,
+            self.transport,
+            conversation["user_id"],
+            conversation["chat_id"],
+            f"new-chat:{event['id']}",
+        )
+        text = result.get("error") or "Создал новый чат. Открой его в списке тем Telegram."
+        await self.store.enqueue(
+            conversation["user_id"],
+            conversation["chat_id"],
+            conversation["thread_id"],
+            {"text": text, "reply_markup": new_chat_keyboard()},
+            f"new-chat-result:{event['id']}",
+        )
+
+    async def topic_title(self, event):
+        data = event["payload"]
+        user_id = data["user_id"]
+        async with self.store.user_lock(user_id):
+            if event["kind"] == "topic_title_reset":
+                from cronos.storage import uid
+
+                async with self.store.connection(user_id) as conn:
+                    row = await conn.fetchrow(
+                        "SELECT * FROM conversations WHERE user_id=$1 AND id=$2",
+                        user_id,
+                        uid(data["conversation_id"]),
+                    )
+                if (
+                    row
+                    and row["revision"] == data["revision"]
+                    and row["title_auto"]
+                    and row["title"] == "Новый чат"
+                    and row["thread_id"] > 0
+                ):
+                    await self.transport.edit_topic(row["chat_id"], row["thread_id"], row["title"])
+                return
+            context = await self.store.topic_title_context(user_id, data["conversation_id"])
+            if context is None or context["conversation"]["revision"] != data["revision"]:
+                return
+            conversation = context["conversation"]
+            run = await self.store.start_run(event["id"], user_id, conversation["id"])
+            status = "failed"
+            try:
+                op = f"{run['id']}:topic_title"
+                result = await self.store.operation(op)
+                if result is None:
+                    result = await self.agent.paid(
+                        run,
+                        op,
+                        lambda: self.provider.topic_title(
+                            context["messages"], conversation["title"]
+                        ),
+                        proactive=True,
+                    )
+                    await self.store.save_operation(op, user_id, run["id"], "topic_title", result)
+                await self.agent.active(run)
+                title = result["message"]["content"]
+                if not await self.transport.edit_topic(
+                    conversation["chat_id"], conversation["thread_id"], title
+                ):
+                    raise RuntimeError("Telegram topic rename was not confirmed")
+                await self.store.set_topic_title(
+                    user_id,
+                    conversation["id"],
+                    title,
+                    context["message_count"],
+                    conversation["revision"],
+                )
+                status = "done"
+            except CancelledRun:
+                status = "cancelled"
+            except asyncio.CancelledError:
+                status = "interrupted"
+                raise
+            finally:
+                await self.store.finish_run(run["id"], status, fence=run["fence"])
+
     async def answer(self, event, conversation, prompt, *, proactive=False, schedule=None):
         run = await self.store.start_run(event["id"], conversation["user_id"], conversation["id"])
         started, cpu = time.monotonic(), time.process_time()
@@ -187,6 +343,8 @@ class Worker:
                 )
             answer = await self.agent.run(run, conversation, prompt, proactive=proactive)
             payload = {"text": answer, "format": "rich"}
+            if not proactive:
+                payload["reply_markup"] = new_chat_keyboard()
             if schedule:
                 payload["schedule_id"] = str(schedule["id"])
                 payload["schedule_revision"] = schedule["revision"]
@@ -217,6 +375,7 @@ class Worker:
                         answer,
                         f"assistant:{event['id']}",
                     )
+                await self.store.queue_topic_title(conversation["user_id"], conversation["id"])
             status = "done"
         except asyncio.CancelledError:
             status = "interrupted"
