@@ -365,12 +365,14 @@ def test_chat_keyboard_uses_creation_callback_and_honest_bot_link():
         "inline_keyboard": [
             [{"text": "➕ Новый чат", "callback_data": "chat:new"}],
             [{"text": "🗑 Удалить этот чат", "callback_data": "chat:delete"}],
+            [{"text": "🪐 Главное меню", "callback_data": "home:main"}],
         ]
     }
     keyboard = chat_navigation_keyboard("@cronos_ait_bot")
     assert keyboard["inline_keyboard"] == [
         [{"text": "➕ Новый чат", "callback_data": "chat:new"}],
         [{"text": "🗑 Удалить этот чат", "callback_data": "chat:delete"}],
+        [{"text": "🪐 Главное меню", "callback_data": "home:main"}],
         [{"text": "Открыть Cronos", "url": "https://t.me/cronos_ait_bot"}],
     ]
     assert chat_navigation_keyboard() == new_chat_keyboard()

@@ -65,6 +65,7 @@ def new_chat_keyboard() -> dict:
         "inline_keyboard": [
             [{"text": "➕ Новый чат", "callback_data": "chat:new"}],
             [{"text": "🗑 Удалить этот чат", "callback_data": "chat:delete"}],
+            [{"text": "🪐 Главное меню", "callback_data": "home:main"}],
         ]
     }
 
@@ -316,6 +317,19 @@ class TelegramTransport:
     async def send(self, chat_id: int, thread_id: int | None, payload: dict) -> list[int]:
         destination: _Destination = {"chat_id": chat_id, "message_thread_id": thread_id or None}
         parts: list[dict[str, Any]] | None = payload.get("_telegram_parts")
+        edit_message_id = payload.get("edit_message_id")
+        if parts is None and edit_message_id is not None:
+            if type(edit_message_id) is not int or edit_message_id <= 0:
+                raise ValueError("A positive Telegram edit message ID is required")
+            if payload.get("document_path") or payload.get("image_path") or payload.get("caption"):
+                raise ValueError("An editable panel must contain only text and its keyboard")
+            if await self._edit_panel(chat_id, edit_message_id, payload):
+                if payload.get("pin"):
+                    await self.pin_message(chat_id, edit_message_id)
+                return [edit_message_id]
+            # An absent/uneditable panel is recreated only in the supplied destination.
+            # Network failures never reach this fallback: the edit may have succeeded.
+            payload = {**payload, "format": "text"}
         if parts is None:
             rich = payload.get("format") == "rich"
             parts = [
@@ -390,13 +404,62 @@ class TelegramTransport:
                     raise ValueError("Unsupported Telegram delivery part")
             except Exception as exc:
                 if sent:
-                    raise PartialDeliveryError(
-                        sent, {"_telegram_parts": parts[index:]}, exc
-                    ) from exc
+                    remainder: dict[str, Any] = {"_telegram_parts": parts[index:]}
+                    if payload.get("pin"):
+                        remainder["pin"] = True
+                    raise PartialDeliveryError(sent, remainder, exc) from exc
                 raise
             sent.append(message.message_id)
             index += 1
+        if payload.get("pin"):
+            await self.pin_message(chat_id, sent[-1])
         return sent
+
+    async def _edit_panel(self, chat_id: int, message_id: int, payload: dict) -> bool:
+        text = str(payload.get("text") or "")
+        if not text:
+            raise ValueError("An editable panel must contain text")
+        markup = (
+            InlineKeyboardMarkup.model_validate(payload["reply_markup"])
+            if payload.get("reply_markup")
+            else None
+        )
+        try:
+            result = await self.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=text,
+                parse_mode=None,
+                reply_markup=markup,
+            )
+        except TelegramBadRequest as exc:
+            description = _bad_request_description(exc)
+            if description in {
+                "message_not_modified",
+                "message is not modified",
+                "message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message",
+            }:
+                return True
+            if description in {"message to edit not found", "message can't be edited"}:
+                return False
+            raise
+        if not result:
+            raise RuntimeError("Telegram did not acknowledge panel update")
+        return True
+
+    async def pin_message(self, chat_id: int, message_id: int) -> bool:
+        """Pin best-effort without converting an acknowledged delivery into a retry."""
+        try:
+            async with asyncio.timeout(5):
+                return bool(
+                    await self.bot.pin_chat_message(
+                        chat_id=chat_id, message_id=message_id, disable_notification=True
+                    )
+                )
+        except Exception as exc:
+            # Exception messages may contain a proxy URL or other sensitive details.
+            logger.info("Telegram pin unavailable: %s", type(exc).__name__)
+            return False
 
     async def draft(self, chat_id: int, thread_id: int | None, text: str, draft_id: int):
         try:

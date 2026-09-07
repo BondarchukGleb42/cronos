@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS users (
 ALTER TABLE users ADD COLUMN IF NOT EXISTS pending_plan text;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS billing_anchor timestamptz;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS content_reset_at timestamptz;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS home_generation uuid NOT NULL DEFAULT gen_random_uuid();
 CREATE TABLE IF NOT EXISTS conversations (
   id uuid PRIMARY KEY, user_id bigint NOT NULL REFERENCES users(user_id), chat_id bigint NOT NULL,
   thread_id bigint NOT NULL DEFAULT 0, title text NOT NULL DEFAULT '', revision integer NOT NULL DEFAULT 0,
@@ -24,6 +25,8 @@ CREATE TABLE IF NOT EXISTS conversations (
 ALTER TABLE conversations ADD COLUMN IF NOT EXISTS title_auto boolean NOT NULL DEFAULT true;
 ALTER TABLE conversations ADD COLUMN IF NOT EXISTS title_message_count integer NOT NULL DEFAULT 0;
 ALTER TABLE conversations ADD COLUMN IF NOT EXISTS title_update_id bigint NOT NULL DEFAULT 0;
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS is_home boolean NOT NULL DEFAULT false;
+CREATE UNIQUE INDEX IF NOT EXISTS conversations_one_home ON conversations(user_id) WHERE is_home;
 CREATE TABLE IF NOT EXISTS deleted_topics (
   user_id bigint NOT NULL, chat_id bigint NOT NULL, thread_id bigint NOT NULL,
   deleted_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY(user_id,chat_id,thread_id)
@@ -56,6 +59,18 @@ CREATE TABLE IF NOT EXISTS events (
   attempts integer NOT NULL DEFAULT 0, error text, created_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS events_pending ON events(state,available_at);
+-- Bootstrap active accounts only; an empty or currently erasing account stays untouched.
+-- The previous worker may still be running when the migration job executes.
+INSERT INTO events(id,kind,payload,state)
+SELECT md5('cronos:home-bootstrap:v1:' || u.user_id::text)::uuid, 'home_init',
+       jsonb_build_object('user_id',u.user_id,'generation',u.home_generation::text),
+       'awaiting_home_worker'
+FROM users u
+WHERE u.user_id>0
+  AND EXISTS(SELECT 1 FROM conversations c WHERE c.user_id=u.user_id)
+  AND NOT EXISTS(SELECT 1 FROM conversations c WHERE c.user_id=u.user_id AND c.is_home)
+  AND NOT EXISTS(SELECT 1 FROM privacy_requests p WHERE p.user_id=u.user_id AND p.state='erasing')
+ON CONFLICT(id) DO NOTHING;
 CREATE TABLE IF NOT EXISTS runs (
   id uuid PRIMARY KEY, event_id uuid UNIQUE REFERENCES events(id), user_id bigint NOT NULL,
   conversation_id uuid NOT NULL REFERENCES conversations(id), status text NOT NULL DEFAULT 'running',

@@ -12,6 +12,16 @@ import aio_pika
 
 from cronos.agent import Agent, CancelledRun, setup_checkpoints
 from cronos.file_tasks import file_task
+from cronos.home import HomeUnavailable, ensure_home, unavailable_panel
+from cronos.home_views import (
+    chats_panel,
+    guide_panel,
+    main_panel,
+    memory_panel,
+    plans_panel,
+    settings_panel,
+    tasks_panel,
+)
 from cronos.lifecycle import cancel_tasks, close_all, run_until_stopped
 from cronos.logging import configure_logging
 from cronos.privacy import (
@@ -23,8 +33,8 @@ from cronos.privacy import (
 from cronos.providers import Provider, ProviderError
 from cronos.settings import get_settings
 from cronos.storage import STOP_COMMANDS, Store, message_command
-from cronos.telegram import TelegramTransport, new_chat_keyboard, upgrade_keyboard
-from cronos.topics import TOPICS_UNAVAILABLE, create_chat, welcome_topic
+from cronos.telegram import TelegramTransport, new_chat_keyboard
+from cronos.topics import create_chat, welcome_topic
 
 log = logging.getLogger(__name__)
 
@@ -55,6 +65,8 @@ class Worker:
                     await self.timer(event)
                 elif event["kind"] == "privacy":
                     await perform_erasure(self.store, self.transport, self.agent.artifacts, event)
+                elif event["kind"] == "home_init":
+                    await self.home_init(event)
                 elif event["kind"] in {"topic_title", "topic_title_reset"}:
                     await self.topic_title(event)
                 else:
@@ -101,7 +113,7 @@ class Worker:
                         and not created.get("is_name_implicit", False),
                         created=True,
                     )
-                    if topic_conversation:
+                    if topic_conversation and not topic_conversation.get("is_home"):
                         await welcome_topic(
                             self.store,
                             user_id,
@@ -126,7 +138,12 @@ class Worker:
                         )
             return
         user_id = sender.get("id")
-        if not user_id or sender.get("is_bot") or message.get("chat", {}).get("type") != "private":
+        if (
+            not user_id
+            or user_id != message["chat"]["id"]
+            or sender.get("is_bot")
+            or message.get("chat", {}).get("type") != "private"
+        ):
             return
         chat_id, thread_id = message["chat"]["id"], message.get("message_thread_id", 0)
         async with self.store.user_lock(user_id):
@@ -140,6 +157,8 @@ class Worker:
                 return
             text = message.get("text") or message.get("caption") or ""
             if await self.privacy_control(event, user_id, chat_id, thread_id, text, callback):
+                return
+            if await self.home_control(event, user_id, chat_id, thread_id, text, callback):
                 return
             conversation = await self.store.conversation(user_id, chat_id, thread_id)
             if callback:
@@ -156,23 +175,6 @@ class Worker:
                         )
                     await self.new_chat(event, conversation)
                     return
-                if data.startswith("plan:"):
-                    balance = await self.store.change_plan(
-                        user_id, data.split(":", 1)[1], f"callback:{callback['id']}"
-                    )
-                    await self.store.enqueue(
-                        user_id,
-                        chat_id,
-                        thread_id,
-                        {
-                            "text": f"Готово! Тариф {balance['plan']}, доступно {balance['tokens_remaining']:,.0f} токенов. Это тестовое повышение — деньги не списывались."
-                        },
-                        f"callback:{callback['id']}",
-                    )
-                with suppress(Exception):
-                    await self.transport.bot.answer_callback_query(
-                        callback["id"], text="Готово — без оплаты"
-                    )
                 return
             text = message.get("text") or message.get("caption") or ""
             command = message_command(text)
@@ -184,26 +186,6 @@ class Worker:
             if command == "/new":
                 await self.new_chat(event, conversation)
                 return
-            if command == "/chats":
-                capabilities = await self.transport.topic_capabilities()
-                if capabilities.has_topics_enabled:
-                    chats = await self.store.list_conversations(user_id)
-                    names = [c["title"] or "Новый чат" for c in chats if c["thread_id"] > 0]
-                    text = (
-                        "Все чаты доступны в списке тем Telegram. Выбери тему, чтобы продолжить её."
-                    )
-                    if names:
-                        text += "\n\n" + "\n".join(f"• {name}" for name in names[:30])
-                else:
-                    text = TOPICS_UNAVAILABLE
-                await self.store.enqueue(
-                    user_id,
-                    chat_id,
-                    thread_id,
-                    {"text": text, "reply_markup": new_chat_keyboard()},
-                    f"chats:{event['id']}",
-                )
-                return
             if command in STOP_COMMANDS:
                 await self.store.enqueue(
                     user_id,
@@ -211,18 +193,6 @@ class Worker:
                     thread_id,
                     {"text": "Остановил текущую задачу. Уже выполненные действия сохранены."},
                     f"stop:{event['id']}",
-                )
-                return
-            if command in {"/upgrade", "/plans"}:
-                await self.store.enqueue(
-                    user_id,
-                    chat_id,
-                    thread_id,
-                    {
-                        "text": "Выбери тестовый тариф — без оплаты.",
-                        "reply_markup": upgrade_keyboard(),
-                    },
-                    f"plans:{event['id']}",
                 )
                 return
             if message.get("voice") or message.get("audio"):
@@ -280,11 +250,154 @@ class Worker:
                         )
                         continue
                 text += f"\n[Пользователь приложил файл: {artifact['filename']}, artifact_id={artifact['id']}, mime={artifact['mime']}]"
-            if command == "/start":
-                text = "Привет! Мы впервые общаемся. Коротко познакомься и помоги мне понять, с чего начать."
             if not text:
                 return
+            await self.store.queue_home(user_id)
             await self.answer(event, conversation, text)
+
+    async def home_init(self, event):
+        user_id = event["payload"]["user_id"]
+        async with self.store.user_lock(user_id):
+            current = await self.store.event_current(event["id"])
+            if not current:
+                return
+            key = await self.store.home_creation_key(user_id)
+            if not key.endswith(":" + str(current["payload"].get("generation"))):
+                return
+            try:
+                home, created = await ensure_home(
+                    self.store, self.transport, user_id, user_id, str(event["id"])
+                )
+                if not created and not home.get("is_home"):
+                    await self.store.enqueue(
+                        user_id,
+                        user_id,
+                        0,
+                        {**main_panel(), "pin": True},
+                        f"home-fallback:{event['id']}",
+                    )
+            except HomeUnavailable as error:
+                await self.store.enqueue(
+                    user_id, user_id, 0, unavailable_panel(str(error)), f"home-error:{event['id']}"
+                )
+
+    async def home_control(self, event, user_id, chat_id, thread_id, text, callback):
+        command_pages = {
+            "/start": "main",
+            "/menu": "main",
+            "/help": "guide",
+            "/tasks": "tasks",
+            "/chats": "chats",
+            "/plans": "plans",
+            "/upgrade": "plans",
+            "/memory": "memory",
+            "/settings": "settings",
+        }
+        data = (callback or {}).get("data") or ""
+        page = command_pages.get(message_command(text)) if not callback else None
+        if not callback and text.strip().casefold() in {"меню", "главное меню"}:
+            page = "main"
+        number, action, value = 0, None, None
+        if data.startswith("home:"):
+            parts = data.split(":")
+            page = parts[1]
+            if page in {"chats", "tasks", "memory"}:
+                if len(parts) != 3 or not parts[2].isdigit() or len(parts[2]) > 6:
+                    page = None
+                else:
+                    number = int(parts[2])
+            elif page == "proactivity" and len(parts) == 3 and parts[2] in {"on", "off"}:
+                action, value, page = "proactivity", parts[2] == "on", "settings"
+            elif page in {"retry", "clearall"} and len(parts) == 2:
+                action, page = page, "main"
+            elif page not in {"main", "guide", "plans", "settings"} or len(parts) != 2:
+                page = None
+            if page is None:
+                with suppress(Exception):
+                    await self.transport.bot.answer_callback_query(
+                        callback["id"], text="Открой актуальное меню командой /menu"
+                    )
+                return True
+        elif data.startswith("plan:") and data[5:] in {"FREE", "START", "PREMIUM", "PRO"}:
+            action, value, page = "plan", data[5:], "plans"
+        if page is None:
+            return False
+        if callback:
+            with suppress(Exception):
+                await self.transport.bot.answer_callback_query(callback["id"])
+        if action == "retry" and not await self.store.get_home(user_id):
+            await self.store.reset_home(user_id, source_key=f"home-retry:{event['id']}")
+        try:
+            home, created = await ensure_home(
+                self.store,
+                self.transport,
+                user_id,
+                chat_id,
+                str(event["id"]),
+                verify=page == "main",
+            )
+        except HomeUnavailable as error:
+            await self.store.enqueue(
+                user_id,
+                chat_id,
+                thread_id,
+                unavailable_panel(str(error)),
+                f"home-error:{event['id']}",
+            )
+            return True
+        if action == "clearall":
+            await self.request_deletion(event, home, "all")
+            return True
+        if action == "proactivity":
+            await self.store.set_proactivity(
+                user_id, bool(value), f"callback:{callback['id']}:proactivity"
+            )
+        if action == "plan":
+            assert isinstance(value, str)
+            balance = await self.store.change_plan(user_id, value, f"callback:{callback['id']}")
+        else:
+            balance = None
+        if page == "main":
+            panel = main_panel()
+        elif page == "guide":
+            panel = guide_panel()
+        elif page == "chats":
+            panel = chats_panel(await self.store.list_conversations(user_id), number)
+        elif page == "tasks":
+            panel = tasks_panel(await self.store.list_schedules(user_id), number)
+        elif page == "plans":
+            panel = plans_panel(balance or await self.store.balance(user_id))
+            if action == "plan":
+                notice = (
+                    f"Переход на {balance['pending_plan']} запланирован на следующий период."
+                    if balance and balance.get("pending_plan")
+                    else "Тариф обновлён — без оплаты."
+                )
+                panel["text"] = notice + "\n\n" + panel["text"]
+        elif page == "settings":
+            panel = settings_panel(await self.store.preferences(user_id))
+        else:
+            panel = memory_panel(await self.store.memories(user_id), number)
+        if callback and thread_id == home["thread_id"]:
+            message_id = (callback.get("message") or {}).get("message_id")
+            if isinstance(message_id, int) and message_id > 0:
+                panel["edit_message_id"] = message_id
+        if not home.get("is_home"):
+            panel["pin"] = True
+        if not (created and page == "main"):
+            order = event.get("update_id") or event["payload"].get("update_id") or 0
+            await self.store.enqueue_home_panel(
+                user_id, chat_id, home["thread_id"], panel, f"home-panel:{event['id']}", order
+            )
+        if thread_id != home["thread_id"]:
+            await self.store.enqueue(
+                user_id,
+                chat_id,
+                thread_id,
+                {"text": "Меню открыто в чате 🪐 Cronos. Выбери его в списке чатов Telegram."},
+                f"home-location:{event['id']}",
+            )
+        return True
 
     async def request_deletion(self, event, conversation, scope):
         request = await self.store.requests_prepare(
@@ -358,7 +471,12 @@ class Worker:
             conversation["user_id"],
             conversation["chat_id"],
             conversation["thread_id"],
-            {"text": text, "reply_markup": new_chat_keyboard()},
+            {
+                "text": text,
+                "reply_markup": main_panel()["reply_markup"]
+                if conversation.get("is_home")
+                else new_chat_keyboard(),
+            },
             f"new-chat-result:{event['id']}",
         )
 
@@ -377,6 +495,7 @@ class Worker:
                     )
                 if (
                     row
+                    and not row.get("is_home")
                     and row["revision"] == data["revision"]
                     and row["title_auto"]
                     and row["title"] == "Новый чат"
@@ -449,6 +568,8 @@ class Worker:
                 payload["reply_markup"] = (
                     confirmation_keyboard(privacy_request)
                     if privacy_request
+                    else main_panel()["reply_markup"]
+                    if conversation.get("is_home")
                     else new_chat_keyboard()
                 )
             if schedule:
@@ -626,6 +747,9 @@ class Worker:
         try:
             await self.store.open()
             await setup_checkpoints(self.settings)
+            # Migrations run while the previous release may still be polling.
+            # Only a worker that understands home_init can release this backfill.
+            await self.store.activate_home_bootstrap()
             tasks = [
                 asyncio.create_task(self.recovery()),
                 asyncio.create_task(self.consume()),

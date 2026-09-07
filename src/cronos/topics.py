@@ -53,6 +53,7 @@ async def create_chat(
     name="Новый чат",
     *,
     creation_scope: str | None = None,
+    show_welcome: bool = True,
 ):
     """Retry DB/delivery work, but never blindly repeat an ambiguous Telegram create."""
     if creation_scope is not None:
@@ -107,5 +108,6 @@ async def create_chat(
         result = {"thread_id": topic["message_thread_id"], "name": topic.get("name", name)}
         await store.save_operation(operation_id, user_id, None, "topic_create", result)
     conversation = await store.conversation(user_id, chat_id, result["thread_id"], result["name"])
-    await welcome_topic(store, user_id, chat_id, result["thread_id"])
+    if show_welcome:
+        await welcome_topic(store, user_id, chat_id, result["thread_id"])
     return {"id": str(conversation["id"]), **result}

@@ -200,4 +200,4 @@ def test_chat_keyboard_exposes_explicit_current_chat_deletion():
     callbacks = [
         button["callback_data"] for row in new_chat_keyboard()["inline_keyboard"] for button in row
     ]
-    assert callbacks == ["chat:new", "chat:delete"]
+    assert callbacks == ["chat:new", "chat:delete", "home:main"]

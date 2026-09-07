@@ -14,6 +14,7 @@ from dateutil.relativedelta import relativedelta
 from cronos.settings import Settings
 
 PLANS = {"FREE": 25_000_000, "START": 700_000_000, "PREMIUM": 1_700_000_000, "PRO": 3_700_000_000}
+HOME_TITLE = "🪐 Cronos"
 STOP_COMMANDS = {"стоп", "остановись", "отмена", "stop", "/stop"}
 
 
@@ -574,6 +575,10 @@ class Store:
                 request["target_thread_id"],
                 request["chat_id"],
             )
+            if full or any(row["is_home"] for row in conversations):
+                await conn.execute(
+                    "UPDATE users SET home_generation=gen_random_uuid() WHERE user_id=$1", owner
+                )
             conversation_ids = [row["id"] for row in conversations]
             runs = await conn.fetch(
                 """SELECT * FROM runs WHERE user_id=$1
@@ -978,6 +983,44 @@ class Store:
                     )
             return await conn.fetchval("SELECT preferences FROM users WHERE user_id=$1", user_id)
 
+    async def set_proactivity(self, user_id: int, enabled: bool, source_key: str) -> dict:
+        """Apply one callback once; return its original minimal preference change on replay."""
+        if not isinstance(enabled, bool):
+            raise ValueError("Инициативность должна быть включена или выключена")
+        await self.ensure_user(user_id)
+        async with self.connection(user_id) as conn:
+            await conn.fetchval("SELECT user_id FROM users WHERE user_id=$1 FOR UPDATE", user_id)
+            existing = await conn.fetchrow("SELECT * FROM operations WHERE id=$1", source_key)
+            if existing:
+                if (
+                    existing["user_id"] != user_id
+                    or existing["kind"] != "home_preference"
+                    or not isinstance(existing["result"], dict)
+                    or not isinstance(existing["result"].get("proactivity"), bool)
+                ):
+                    raise ValueError("Операция настройки недоступна")
+                return existing["result"]
+            result = {"proactivity": enabled}
+            await conn.execute(
+                "UPDATE users SET preferences=preferences||$2::jsonb WHERE user_id=$1",
+                user_id,
+                result,
+            )
+            if not enabled:
+                await conn.execute(
+                    """UPDATE schedules SET state='cancelled',revision=revision+1
+                    WHERE user_id=$1 AND proactive AND state<>'cancelled'""",
+                    user_id,
+                )
+            await conn.execute(
+                """INSERT INTO operations(id,user_id,kind,result,status)
+                VALUES($1,$2,'home_preference',$3,'done')""",
+                source_key,
+                user_id,
+                result,
+            )
+            return result
+
     async def conversation(self, user_id: int, chat_id: int, thread_id: int | None, title=""):
         await self.ensure_user(user_id)
         async with self.connection(user_id) as conn:
@@ -999,12 +1042,125 @@ class Store:
                 )
             )
 
+    async def activate_home_bootstrap(self) -> int:
+        """Only a home-aware worker activates migration jobs after replacing its predecessor."""
+        async with self.connection() as conn:
+            return await conn.fetchval(
+                """WITH activated AS (
+                    UPDATE events SET state='pending',available_at=now(),notified_at=NULL
+                    WHERE kind='home_init' AND state='awaiting_home_worker' RETURNING id
+                ) SELECT count(*) FROM activated"""
+            )
+
+    async def queue_home(self, user_id: int) -> bool:
+        """Queue home only for a live interaction; caller already ensured the account."""
+        async with self.connection(user_id) as conn:
+            return bool(
+                await conn.fetchval(
+                    """INSERT INTO events(id,kind,payload)
+                SELECT md5('cronos:home-init:' || u.user_id::text || ':' || u.home_generation::text)::uuid,
+                       'home_init',jsonb_build_object('user_id',u.user_id,'generation',u.home_generation::text)
+                FROM users u WHERE u.user_id=$1
+                  AND NOT EXISTS(SELECT 1 FROM conversations c WHERE c.user_id=u.user_id AND c.is_home)
+                  AND NOT EXISTS(SELECT 1 FROM privacy_requests p WHERE p.user_id=u.user_id AND p.state='erasing')
+                ON CONFLICT(id) DO NOTHING RETURNING id""",
+                    user_id,
+                )
+            )
+
+    async def get_home(self, user_id: int) -> dict | None:
+        async with self.connection(user_id) as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM conversations WHERE user_id=$1 AND is_home", user_id
+            )
+            return dict(row) if row else None
+
+    async def home_creation_key(self, user_id: int) -> str:
+        async with self.connection(user_id) as conn:
+            generation = await conn.fetchval(
+                "SELECT home_generation FROM users WHERE user_id=$1", user_id
+            )
+        if generation is None:
+            generation = (await self.ensure_user(user_id))["home_generation"]
+        return f"home-create:{user_id}:{generation}"
+
+    async def set_home(self, user_id: int, conversation_id) -> dict:
+        """Promote one owned conversation; caller holds the user's work lock."""
+        async with self.connection(user_id) as conn:
+            await conn.fetchval("SELECT user_id FROM users WHERE user_id=$1 FOR UPDATE", user_id)
+            conversation = await conn.fetchrow(
+                "SELECT * FROM conversations WHERE user_id=$1 AND id=$2 FOR UPDATE",
+                user_id,
+                uid(conversation_id),
+            )
+            if not conversation:
+                raise ValueError("Чат не найден")
+            existing = await conn.fetchval(
+                "SELECT id FROM conversations WHERE user_id=$1 AND is_home", user_id
+            )
+            if existing and existing != conversation["id"]:
+                raise ValueError("Домашняя тема уже существует")
+            row = await conn.fetchrow(
+                """UPDATE conversations SET is_home=true,title=$3,title_auto=false,
+                title_message_count=0,revision=revision+CASE
+                WHEN NOT is_home OR title_auto OR title IS DISTINCT FROM $3 THEN 1 ELSE 0 END
+                WHERE user_id=$1 AND id=$2 RETURNING *""",
+                user_id,
+                conversation["id"],
+                HOME_TITLE,
+            )
+            return dict(row)
+
+    async def reset_home(
+        self, user_id: int, conversation_id=None, *, source_key: str | None = None
+    ) -> str:
+        """Explicit recovery only: retain history and rotate the durable creation key."""
+        async with self.connection(user_id) as conn:
+            if not await conn.fetchval(
+                "SELECT user_id FROM users WHERE user_id=$1 FOR UPDATE", user_id
+            ):
+                raise ValueError("Пользователь не найден")
+            if source_key is not None:
+                existing = await conn.fetchrow("SELECT * FROM operations WHERE id=$1", source_key)
+                if existing:
+                    if (
+                        existing["user_id"] != user_id
+                        or existing["kind"] != "home_reset"
+                        or not isinstance(existing["result"], dict)
+                        or not isinstance(existing["result"].get("key"), str)
+                    ):
+                        raise ValueError("Операция восстановления недоступна")
+                    return existing["result"]["key"]
+            if conversation_id is not None:
+                demoted = await conn.fetchval(
+                    """UPDATE conversations SET is_home=false,revision=revision+1
+                    WHERE user_id=$1 AND id=$2 AND is_home RETURNING id""",
+                    user_id,
+                    uid(conversation_id),
+                )
+                if demoted is None:
+                    raise ValueError("Домашняя тема не найдена")
+            generation = await conn.fetchval(
+                "UPDATE users SET home_generation=gen_random_uuid() WHERE user_id=$1 RETURNING home_generation",
+                user_id,
+            )
+            key = f"home-create:{user_id}:{generation}"
+            if source_key is not None:
+                await conn.execute(
+                    """INSERT INTO operations(id,user_id,kind,result,status)
+                    VALUES($1,$2,'home_reset',$3,'done')""",
+                    source_key,
+                    user_id,
+                    {"key": key},
+                )
+            return key
+
     async def list_conversations(self, user_id: int):
         async with self.connection(user_id) as conn:
             return [
                 dict(x)
                 for x in await conn.fetch(
-                    "SELECT id,title,chat_id,thread_id FROM conversations WHERE user_id=$1 ORDER BY created_at DESC",
+                    "SELECT id,title,chat_id,thread_id,is_home FROM conversations WHERE user_id=$1 ORDER BY created_at DESC",
                     user_id,
                 )
             ]
@@ -1015,7 +1171,12 @@ class Store:
             user_id,
             uid(conversation_id),
         )
-        if not conversation or not conversation["title_auto"] or conversation["thread_id"] <= 0:
+        if (
+            not conversation
+            or conversation["is_home"]
+            or not conversation["title_auto"]
+            or conversation["thread_id"] <= 0
+        ):
             return None
         counts = await conn.fetchrow(
             """SELECT count(*) AS total, bool_or(role='user') AS has_user,
@@ -1085,7 +1246,7 @@ class Store:
             return bool(
                 await conn.fetchval(
                     """UPDATE conversations SET title=$3,title_message_count=$4
-                    WHERE user_id=$1 AND id=$2 AND title_auto AND thread_id>0 AND revision=$5
+                    WHERE user_id=$1 AND id=$2 AND title_auto AND NOT is_home AND thread_id>0 AND revision=$5
                     AND title_message_count<GREATEST(2,($4::integer/10)*10)
                     RETURNING id""",
                     user_id,
@@ -1145,6 +1306,19 @@ class Store:
                     return None
                 if update_id == row["title_update_id"]:
                     return dict(row)
+            if row["is_home"]:
+                # Native manual renames are repaired by the caller using this canonical row.
+                row = await conn.fetchrow(
+                    """UPDATE conversations SET title=$3,title_auto=false,
+                    title_update_id=CASE WHEN $4 AND $5::bigint>0 THEN $5 ELSE title_update_id END
+                    WHERE user_id=$1 AND id=$2 RETURNING *""",
+                    user_id,
+                    row["id"],
+                    HOME_TITLE,
+                    manual,
+                    update_id,
+                )
+                return dict(row)
             row = await conn.fetchrow(
                 """UPDATE conversations SET
                 title=CASE WHEN $4 OR title_auto THEN $3 ELSE title END,
@@ -1218,7 +1392,8 @@ class Store:
             await conn.execute("UPDATE messages SET excluded=true WHERE user_id=$1", user_id)
             conversations = await conn.fetch(
                 """UPDATE conversations SET revision=revision+1,title_message_count=0,
-                title=CASE WHEN title_auto AND thread_id>0 THEN 'Новый чат' ELSE title END
+                title=CASE WHEN is_home THEN '🪐 Cronos' WHEN title_auto AND thread_id>0 THEN 'Новый чат' ELSE title END,
+                title_auto=CASE WHEN is_home THEN false ELSE title_auto END
                 WHERE user_id=$1 RETURNING id,revision,thread_id,title_auto""",
                 user_id,
             )
@@ -1315,6 +1490,61 @@ class Store:
                 chat_id,
                 thread_id or 0,
                 payload,
+                dedupe_key,
+            )
+
+    async def enqueue_home_panel(
+        self,
+        user_id: int,
+        chat_id: int,
+        thread_id: int | None,
+        payload: dict,
+        dedupe_key: str,
+        order: int,
+    ) -> int | None:
+        """Serialize panel edits with delivery; old callbacks cannot replace a newer panel."""
+        if not dedupe_key.startswith("home-panel:"):
+            raise ValueError("Неизвестный ключ домашней панели")
+        if not isinstance(order, int) or isinstance(order, bool):
+            raise ValueError("Некорректный порядок панели")
+        async with self.user_lock(user_id, purpose="delivery"), self.connection(user_id) as conn:
+            existing = await conn.fetchrow(
+                "SELECT id,user_id FROM outbox WHERE dedupe_key=$1", dedupe_key
+            )
+            if existing:
+                if existing["user_id"] != user_id:
+                    raise ValueError("Панель недоступна")
+                return existing["id"]
+            edit_id = payload.get("edit_message_id")
+            if edit_id is not None:
+                if not isinstance(edit_id, int) or isinstance(edit_id, bool) or edit_id <= 0:
+                    raise ValueError("Некорректное сообщение панели")
+                latest = await conn.fetchval(
+                    """SELECT max((payload->>'home_panel_order')::bigint) FROM outbox
+                    WHERE user_id=$1 AND chat_id=$2 AND dedupe_key LIKE 'home-panel:%'
+                    AND payload->>'edit_message_id'=$3""",
+                    user_id,
+                    chat_id,
+                    str(edit_id),
+                )
+                if latest is not None and latest > order:
+                    return None
+                await conn.execute(
+                    """UPDATE outbox SET state='cancelled',owner=NULL,lease_until=NULL,
+                    error='Superseded home panel' WHERE user_id=$1 AND chat_id=$2
+                    AND dedupe_key LIKE 'home-panel:%' AND payload->>'edit_message_id'=$3
+                    AND state IN ('pending','sending')""",
+                    user_id,
+                    chat_id,
+                    str(edit_id),
+                )
+            return await conn.fetchval(
+                """INSERT INTO outbox(user_id,chat_id,thread_id,payload,dedupe_key)
+                VALUES($1,$2,$3,$4,$5) RETURNING id""",
+                user_id,
+                chat_id,
+                thread_id or 0,
+                {**payload, "home_panel_order": order},
                 dedupe_key,
             )
 

@@ -187,13 +187,19 @@ async def test_worker_waits_for_background_tasks_before_closing_clients(monkeypa
 
     worker = Worker.__new__(Worker)
     worker.settings = SimpleNamespace()
-    worker.store = SimpleNamespace(open=AsyncMock(), close=AsyncMock(side_effect=close_database))
+    worker.store = SimpleNamespace(
+        open=AsyncMock(),
+        activate_home_bootstrap=AsyncMock(return_value=0),
+        close=AsyncMock(side_effect=close_database),
+    )
     worker.transport = SimpleNamespace(close=AsyncMock())
     worker.provider = SimpleNamespace(close=AsyncMock())
     worker.recovery = worker.consume = worker.health = background
     task = asyncio.create_task(worker.run())
-    await started.wait()
+    async with asyncio.timeout(5):
+        await started.wait()
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
     worker.store.close.assert_awaited_once()
+    worker.store.activate_home_bootstrap.assert_awaited_once()

@@ -87,12 +87,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     [
                         BotCommand(command=command, description=description)
                         for command, description in (
+                            ("menu", "Главное меню 🪐 Cronos"),
                             ("new", "Новый чат"),
                             ("chats", "Мои чаты"),
+                            ("tasks", "Мои задачи"),
+                            ("plans", "Мой тариф"),
+                            ("help", "Что умеет Cronos"),
+                            ("memory", "Что Cronos помнит обо мне"),
+                            ("settings", "Настройки"),
                             ("delete", "Удалить текущий чат"),
                             ("clearall", "Полная очистка данных"),
                             ("stop", "Остановить ответ"),
-                            ("plans", "Тестовые тарифы"),
                             ("start", "Начать общение"),
                         )
                     ],
