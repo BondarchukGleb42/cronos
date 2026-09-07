@@ -93,6 +93,14 @@ async def project(case, *, conversation=None, name="Цены овощей", goal
     )
 
 
+async def test_index_helpers_work_with_restricted_maintenance_search_path(case):
+    async with case.store.connection(A) as conn:
+        await conn.execute("SET LOCAL search_path=pg_catalog")
+        assert await conn.fetchval(
+            "SELECT public.cronos_library_vector('pg_catalog.simple'::regconfig,'MARKER','body') @@ to_tsquery('pg_catalog.simple','marker')"
+        )
+
+
 @pytest.mark.parametrize("kind", ["message", "artifact", "project"])
 async def test_owner_isolation_in_search_and_direct_reads(case, kind):
     if kind == "message":
