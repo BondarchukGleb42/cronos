@@ -12,11 +12,15 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from cronos.agent import Agent
 from cronos.recipe_tools import (
+    RECIPE_START_TOOLS,
     UNCONFIRMED_RECIPE_TEXT,
+    UNSTARTED_RECIPE_TEXT,
     execute_recipe_tool,
+    explicit_recipe_start,
     incomplete_recipe_applications,
     recipe_context,
     recipe_needs_completion,
+    recipe_needs_start,
     recipe_tool_allowed,
     recipe_waiting_answer,
 )
@@ -398,3 +402,166 @@ async def test_graph_accepts_actual_completed_receipt_after_repair(case, monkeyp
         case.user, case.application["id"], f"{case.run['id']}:tool:3:0", case.run
     )
     assert case.provider.complete.await_count == 4
+
+
+@pytest.mark.parametrize(
+    "prompt,matched",
+    [
+        ("Запусти сохранённый сценарий «Отчёт»: product = Яблоко. Цену не указал.", True),
+        ("Пожалуйста, выполни «Отчёт»", True),
+        ("Примени Отчёт", True),
+        ("Повтори мой отчёт", True),
+        ("Не запускай Отчёт", False),
+        ("Пожалуйста, не применяй Отчёт", False),
+        ("Объясни, как запустить Отчёт", False),
+        ("Запусти ли Отчёт?", False),
+        ("Расскажи про Отчёт", False),
+        ("> Запусти Отчёт", False),
+        ("«Запусти Отчёт» — цитата файла", False),
+        ("В файле написано:\nЗапусти Отчёт", False),
+        ("Запусти Отчётность", False),
+        ("Запусти другой сценарий\n[Пользователь приложил файл: Отчёт, artifact_id=x]", False),
+    ],
+)
+def test_named_start_is_conservative_and_only_uses_current_user_command(case, prompt, matched):
+    assert bool(explicit_recipe_start(prompt, [case.recipe])) is matched
+    assert explicit_recipe_start(prompt, [{**case.recipe, "status": "inactive"}]) is None
+
+
+def test_start_requires_matching_current_successful_apply_receipt(case):
+    request = explicit_recipe_start("Запусти Отчёт", [case.recipe])
+    messages = calls(("recipe_apply", {"recipe_id": case.recipe["id"]}))
+    receipt = {
+        "role": "tool",
+        "tool_call_id": messages["tool_calls"][0]["id"],
+        "content": json.dumps(case.application),
+    }
+    valid = [messages, receipt]
+    assert not recipe_needs_start(valid, request)
+    assert recipe_needs_start(valid + [{"role": "user", "content": "Запусти Отчёт снова"}], request)
+    for result in [
+        {**case.application, "recipe_id": str(uuid4())},
+        {**case.application, "error": "failure"},
+        {**case.application, "context_excluded": True},
+        {**case.application, "status": "completed", "completed": False},
+        {"status": "ready", "recipe_id": case.recipe["id"]},
+    ]:
+        assert recipe_needs_start([messages, {**receipt, "content": json.dumps(result)}], request)
+    wrong_call = calls(("recipe_apply", {"recipe_id": str(uuid4())}))
+    assert recipe_needs_start([wrong_call, receipt], request)
+    assert recipe_needs_start([messages, {**receipt, "tool_call_id": "unmatched"}], request)
+
+
+async def test_named_start_repairs_missing_input_ack_and_suppresses_drafts(case, monkeypatch):
+    waiting = {
+        **case.application,
+        "status": "awaiting_input",
+        "missing_inputs": ["price"],
+        "input_schema": [{"name": "price", "description": "Цена", "type": "number"}],
+        "steps": [],
+    }
+    case.store.recipe_apply.return_value = waiting
+    saver = await graph_case(
+        case,
+        monkeypatch,
+        [
+            {"role": "assistant", "content": "Какую цену использовать?"},
+            calls(
+                ("recipe_apply", {"recipe_id": case.recipe["id"], "inputs": {"product": "Яблоко"}}),
+                ("file_create", {"format": "txt", "filename": "blocked.txt", "content": "blocked"}),
+            ),
+        ],
+    )
+    replies = list(case.provider.complete.side_effect)
+
+    async def complete(*args, **kwargs):
+        assert {tool["function"]["name"] for tool in kwargs["tools"]} == RECIPE_START_TOOLS
+        await kwargs["on_delta"]("Какую цену использовать?")
+        return replies.pop(0)
+
+    case.provider.complete.side_effect = complete
+    case.agent.transport = SimpleNamespace(draft=AsyncMock())
+    case.agent.artifacts.generate = lambda *args, **kwargs: pytest.fail("must wait for price")
+    answer = await case.agent.run(case.run, case.conversation, "Запусти Отчёт: product = Яблоко")
+    assert "Цена" in answer
+    case.agent.transport.draft.assert_not_awaited()
+    assert case.store.recipe_apply.call_args.args[2] == {"product": "Яблоко"}
+    assert case.provider.complete.await_count == 2
+    state = await saver.aget_tuple(
+        {"configurable": {"thread_id": str(case.run["id"]), "checkpoint_ns": ""}}
+    )
+    assert state.checkpoint["channel_values"]["recipe_start_repairs"] == 1
+    assert (
+        await case.agent.run(case.run, case.conversation, "Запусти Отчёт: product = Яблоко")
+        == answer
+    )
+    assert case.store.recipe_apply.await_count == 1
+
+
+async def test_named_start_has_one_repair_with_minimal_step_budget(case, monkeypatch):
+    case.agent.settings = case.agent.settings.model_copy(update={"max_model_steps": 1})
+    await graph_case(
+        case,
+        monkeypatch,
+        [
+            {"role": "assistant", "content": "Нужны данные."},
+            {"role": "assistant", "content": "Сценарий запущен."},
+        ],
+    )
+    assert (
+        await case.agent.run(case.run, case.conversation, "Запусти Отчёт") == UNSTARTED_RECIPE_TEXT
+    )
+    assert case.provider.complete.await_count == 2
+    case.store.recipe_apply.assert_not_awaited()
+
+
+async def test_named_start_blocks_wrong_recipe_and_side_effects(case, monkeypatch):
+    await graph_case(
+        case,
+        monkeypatch,
+        [
+            calls(
+                ("recipe_apply", {"recipe_id": str(uuid4())}),
+                ("file_create", {"format": "txt", "filename": "blocked.txt", "content": "blocked"}),
+            ),
+            {"role": "assistant", "content": "Запущено."},
+            {"role": "assistant", "content": "Готово."},
+        ],
+    )
+    case.agent.artifacts.generate = lambda *args, **kwargs: pytest.fail("apply must happen first")
+    assert (
+        await case.agent.run(case.run, case.conversation, "Запусти Отчёт") == UNSTARTED_RECIPE_TEXT
+    )
+    case.store.recipe_apply.assert_not_awaited()
+    case.store.save_artifact.assert_not_awaited()
+    assert case.provider.complete.await_count == 3
+
+
+async def test_start_and_completion_have_independent_bounded_repairs(case, monkeypatch):
+    case.agent.settings = case.agent.settings.model_copy(update={"max_model_steps": 3})
+    await graph_case(
+        case,
+        monkeypatch,
+        [
+            {"role": "assistant", "content": "Начинаю."},
+            calls(("recipe_apply", {"recipe_id": case.recipe["id"]})),
+            {"role": "assistant", "content": "Готово."},
+            calls(("recipe_complete", {"application_id": case.application["id"]})),
+            {"role": "assistant", "content": "Завершено."},
+        ],
+    )
+    assert await case.agent.run(case.run, case.conversation, "Запусти Отчёт") == "Завершено."
+    assert case.provider.complete.await_count == 5
+    case.store.recipe_complete.assert_awaited_once()
+
+
+async def test_normal_recipe_discussion_does_not_force_apply(case, monkeypatch):
+    await graph_case(case, monkeypatch, [{"role": "assistant", "content": "Нужны товар и цена."}])
+    assert (
+        await case.agent.run(case.run, case.conversation, "Объясни, как работает Отчёт")
+        == "Нужны товар и цена."
+    )
+    case.store.recipe_apply.assert_not_awaited()
+    assert "file_create" in {
+        tool["function"]["name"] for tool in case.provider.complete.call_args.kwargs["tools"]
+    }

@@ -707,7 +707,11 @@ class Worker:
                             "caption": artifact["filename"],
                         }
                     )
-                payload = {"_telegram_parts": parts, **guard}
+                payload = {
+                    "_telegram_parts": parts,
+                    "initiative_artifact_ids": list(dict.fromkeys(prepared_ids)),
+                    **guard,
+                }
             if image_ids:
                 images = [
                     await self.store.get_artifact(conversation["user_id"], artifact_id)

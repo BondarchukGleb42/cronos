@@ -84,12 +84,12 @@ async def case():
                     "usage",
                     "reservations",
                     "run_metrics",
+                    "artifacts",
                     "runs",
                     "projects",
                     "schedules",
                     "memory",
                     "messages",
-                    "artifacts",
                     "ledger",
                     "conversations",
                     "users",
@@ -243,6 +243,100 @@ async def test_pending_suppression_failed_retry_and_sent_fingerprint(case):
     assert delivered == {"should_send": False, "reason": "already_delivered"}
     changed = await decide(case, policy, evidence="Москва: огурцы 90 руб/кг")
     assert changed["should_send"] is True
+
+
+async def test_sent_files_join_project_search_only_after_full_ack_and_replay_once(case):
+    store = case.store
+    policy = await configure(case)
+    schedule = await store.get_schedule(policy["schedule_id"])
+    run, other_run = await case.make_run(schedule), await case.make_run(schedule)
+    prepared, unrelated, excluded = (str(uuid4()) for _ in range(3))
+    for artifact_id, source_run in (
+        (prepared, run),
+        (unrelated, other_run),
+        (excluded, run),
+    ):
+        await store.save_artifact(
+            A,
+            {
+                "id": artifact_id,
+                "filename": "prepared.csv",
+                "mime": "text/csv",
+                "path": f"/synthetic/{artifact_id}.csv",
+                "extracted": {"text": "acknowledgedreport: огурцы 90 руб/кг"},
+            },
+        )
+        await store.register_artifact_version(
+            A,
+            artifact_id,
+            project_id=policy["project_id"],
+            source_key=f"prepared:{artifact_id}",
+            run=source_run,
+        )
+    async with store.connection(A) as conn:
+        await conn.execute(
+            "UPDATE artifact_versions SET context_excluded=true WHERE artifact_id=$1",
+            UUID(excluded),
+        )
+    decision = await decide(case, policy, run=run)
+    payload = {
+        "_telegram_parts": [
+            {"kind": "rich", "text": "Подготовлено сравнение."},
+            {"kind": "document", "path": f"/synthetic/{prepared}.csv"},
+        ],
+        "initiative_artifact_ids": [prepared, unrelated, excluded, prepared],
+        **decision["delivery_guard"],
+    }
+    outbox_id = await store.enqueue_for_run(run, case.conversation, payload, "prepared-ack")
+    assert outbox_id is not None
+
+    async def snapshot():
+        async with store.connection(A) as conn:
+            links = await conn.fetch(
+                "SELECT artifact_id FROM project_artifacts WHERE project_id=$1",
+                UUID(policy["project_id"]),
+            )
+            revision = await conn.fetchval(
+                "SELECT revision FROM projects WHERE id=$1", UUID(policy["project_id"])
+            )
+            journal = await conn.fetch(
+                "SELECT * FROM project_changes WHERE project_id=$1 AND kind='attach_artifact'",
+                UUID(policy["project_id"]),
+            )
+        search = await store.library_search(
+            A, "acknowledgedreport", kinds=["artifact"], project_id=policy["project_id"]
+        )
+        return {str(row["artifact_id"]) for row in links}, revision, journal, search["hits"]
+
+    assert await snapshot() == (set(), policy["project_revision"], [], [])
+    # A partial transport success only stores the unacknowledged tail and known IDs.
+    async with store.connection(A) as conn:
+        await conn.execute(
+            """UPDATE outbox SET payload=$2,telegram_ids='[101]',state='pending',
+            owner='initiative-ack-test' WHERE id=$1""",
+            outbox_id,
+            {**payload, "_telegram_parts": payload["_telegram_parts"][1:]},
+        )
+    assert await snapshot() == (set(), policy["project_revision"], [], [])
+    await store.delivery_result(outbox_id, "initiative-ack-test", error="Failed", permanent=True)
+    assert await snapshot() == (set(), policy["project_revision"], [], [])
+    async with store.connection(A) as conn:
+        await conn.execute("UPDATE outbox SET state='sending' WHERE id=$1", outbox_id)
+        await conn.execute("UPDATE runs SET status='done' WHERE id=$1", run["id"])
+    async with store.user_lock(A, purpose="delivery"):
+        await store.delivery_result(outbox_id, "initiative-ack-test", ids=[101, 102])
+    links, revision, journal, hits = await snapshot()
+    assert links == {prepared} and revision == policy["project_revision"] + 1
+    assert len(journal) == 1 and journal[0]["patch"] == {"artifact_ids": [prepared]}
+    assert journal[0]["run_id"] == run["id"]
+    assert journal[0]["conversation_id"] == case.conversation["id"]
+    assert journal[0]["source_key"] == (
+        f"initiative:delivered:{decision['delivery_guard']['initiative_decision_id']}"
+    )
+    assert [hit["id"] for hit in hits] == [prepared]
+    async with store.user_lock(A, purpose="delivery"):
+        await store.delivery_result(outbox_id, "initiative-ack-test", ids=[101, 102])
+    assert await snapshot() == (links, revision, journal, hits)
 
 
 async def test_skip_and_empty_reason_cannot_authorize_delivery(case):

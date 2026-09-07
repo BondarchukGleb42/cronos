@@ -1,6 +1,7 @@
 """Recipe dispatch and graph guards; definitions never execute tools on their own."""
 
 import json
+import re
 from uuid import UUID
 
 from cronos.recipes import RECIPE_STEP_TOOLS
@@ -18,6 +19,103 @@ UNCONFIRMED_RECIPE_TEXT = (
     "Не удалось подтвердить выполнение всех шагов сценария. "
     "Уже полученные результаты сохранены. Сценарий пока не завершён."
 )
+RECIPE_START_TOOLS = frozenset({"recipe_get", "recipe_list", "recipe_apply", "skill_info"})
+RECIPE_START_REPAIR_PROMPT = """Пользователь явно попросил запустить сохранённый сценарий, но успешного recipe_apply для него ещё нет.
+Сначала вызови recipe_apply с его recipe_id и уже известными inputs, ДАЖЕ если обязательные поля заполнены не все.
+Не угадывай отсутствующие значения: awaiting_input надёжно сохранит начало сценария и запросит их у пользователя.
+До этого не выполняй шаги сценария и не подтверждай его запуск. Если запустить невозможно, сообщи об этом честно."""
+UNSTARTED_RECIPE_TEXT = (
+    "Сценарий пока не запущен: не удалось сохранить начало его выполнения. "
+    "Попробуй попросить запустить его ещё раз."
+)
+
+
+def explicit_recipe_start(prompt, available):
+    """Conservative command recognizer; inspect only this incoming user text.
+
+    This is intentionally not general intent classification. Quoted source text,
+    explanations, ambiguous names and ordinary discussion do not activate it.
+    """
+    if isinstance(prompt, list):
+        prompt = next(
+            (
+                part.get("text", "")
+                for part in prompt
+                if isinstance(part, dict) and part.get("type") == "text"
+            ),
+            "",
+        )
+    if not isinstance(prompt, str):
+        return None
+    text = prompt.split("\n[Пользователь приложил файл:", 1)[0].strip()
+    if not re.match(r"^(?:пожалуйста[\s,]+)?(?:запусти|выполни|примени|повтори)\b", text, re.I):
+        return None
+    # A name must appear in the initial command, before prose/attached content.
+    command = re.split(r"[\n:;.!?]", text, maxsplit=1)[0]
+    if re.search(r"\b(?:не|нет|никогда|нельзя|если|как|ли|объясни|расскажи)\b", command, re.I):
+        return None
+    matches = []
+    for recipe in available:
+        name = recipe.get("name")
+        if (
+            recipe.get("status") != "active"
+            or recipe.get("context_excluded")
+            or not isinstance(name, str)
+            or not name.strip()
+            or _identifier(recipe.get("id")) is None
+        ):
+            continue
+        if re.search(r"(?<!\w)" + re.escape(name.strip()) + r"(?!\w)", command, re.I):
+            matches.append({"id": recipe["id"], "name": name})
+    return matches[0] if len(matches) == 1 else None
+
+
+def recipe_needs_start(messages, requested):
+    if not requested:
+        return False
+    # Saved conversational history must not satisfy this run's new command.
+    start = max(
+        (index for index, item in enumerate(messages) if item.get("role") == "user"), default=0
+    )
+    calls = {}
+    for message in messages[start:]:
+        if message.get("role") == "assistant":
+            for call in message.get("tool_calls") or []:
+                if (
+                    not isinstance(call, dict)
+                    or not isinstance(call.get("id"), str)
+                    or not call["id"]
+                ):
+                    continue
+                function = call.get("function", {})
+                if not isinstance(function, dict) or function.get("name") != "recipe_apply":
+                    continue
+                try:
+                    args = json.loads(function.get("arguments", ""))
+                except TypeError, ValueError:
+                    continue
+                if isinstance(args, dict) and args.get("recipe_id") == requested["id"]:
+                    calls[call.get("id")] = True
+        elif message.get("role") == "tool" and message.get("tool_call_id") in calls:
+            try:
+                result = json.loads(message.get("content", ""))
+            except TypeError, ValueError:
+                continue
+            if (
+                not isinstance(result, dict)
+                or "error" in result
+                or result.get("context_excluded")
+                or result.get("recipe_id") != requested["id"]
+                or _identifier(result.get("id")) is None
+            ):
+                continue
+            if result.get("status") == "ready":
+                return False
+            if result.get("status") == "awaiting_input" and result.get("missing_inputs"):
+                return False
+            if result.get("status") == "completed" and result.get("completed") is True:
+                return False
+    return True
 
 
 async def execute_recipe_tool(store, name, args, op, run, conversation):

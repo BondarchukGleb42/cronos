@@ -174,16 +174,68 @@ async def mark_initiative_sent(conn, payload):
         decision_id = UUID(str(payload["initiative_decision_id"]))
     except KeyError, ValueError, TypeError:
         return
-    await conn.execute(
+    origin = await conn.fetchrow(
         """UPDATE initiative_policies i SET last_fingerprint=$3,updated_at=clock_timestamp()
         FROM initiative_operations d WHERE i.id=$1 AND d.id=$2 AND d.initiative_id=i.id
         AND d.user_id=i.user_id AND d.kind='decide' AND d.result->>'should_send'='true'
         AND d.result->'delivery_guard'->>'initiative_fingerprint'=$3
-        AND i.revision=$4 AND i.status='active'""",
+        AND i.revision=$4 AND i.status='active'
+        RETURNING i.user_id,i.project_id,d.run_id,d.conversation_id""",
         policy_id,
         decision_id,
         payload.get("initiative_fingerprint"),
         payload.get("initiative_revision"),
+    )
+    artifact_ids = payload.get("initiative_artifact_ids")
+    if not origin or not isinstance(artifact_ids, list) or not artifact_ids:
+        return
+    try:
+        artifact_ids = list(dict.fromkeys(UUID(str(value)) for value in artifact_ids))
+    except ValueError, TypeError:
+        return
+    if not await _decision_valid(conn, origin["user_id"], payload):
+        return
+    # The sender already owns the delivery lock. Attach directly in this transaction;
+    # calling the public attach method would try to acquire that same lock again.
+    added = await conn.fetch(
+        """INSERT INTO project_artifacts(user_id,project_id,artifact_id)
+        SELECT v.user_id,v.project_id,v.artifact_id FROM artifact_versions v
+        JOIN users u ON u.user_id=v.user_id
+        JOIN runs r ON r.user_id=v.user_id AND r.id=v.run_id
+        JOIN projects p ON p.user_id=v.user_id AND p.id=v.project_id
+        WHERE v.user_id=$1 AND v.project_id=$2 AND v.run_id=$3
+        AND v.conversation_id=$4 AND v.artifact_id=ANY($5::uuid[])
+        AND NOT v.context_excluded AND v.memory_revision=u.memory_revision
+        AND r.memory_revision=u.memory_revision AND NOT r.cancel_requested
+        AND NOT p.context_excluded AND p.status='active' AND p.revision=$6
+        ON CONFLICT DO NOTHING RETURNING artifact_id""",
+        origin["user_id"],
+        origin["project_id"],
+        origin["run_id"],
+        origin["conversation_id"],
+        artifact_ids,
+        payload.get("initiative_project_revision"),
+    )
+    if not added:
+        return
+    revision = await conn.fetchval(
+        """UPDATE projects SET revision=revision+1,updated_at=clock_timestamp()
+        WHERE user_id=$1 AND id=$2 RETURNING revision""",
+        origin["user_id"],
+        origin["project_id"],
+    )
+    await conn.execute(
+        """INSERT INTO project_changes
+        (id,user_id,project_id,revision,kind,source_key,conversation_id,run_id,patch)
+        VALUES($1,$2,$3,$4,'attach_artifact',$5,$6,$7,$8)""",
+        uuid4(),
+        origin["user_id"],
+        origin["project_id"],
+        revision,
+        f"initiative:delivered:{decision_id}",
+        origin["conversation_id"],
+        origin["run_id"],
+        {"artifact_ids": sorted(str(row["artifact_id"]) for row in added)},
     )
 
 

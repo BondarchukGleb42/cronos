@@ -181,6 +181,7 @@ async def test_prepared_text_and_all_files_share_one_guarded_outbox_and_no_draft
         {"kind": "document", "path": "/synthetic/second.csv", "caption": "second.csv"},
     ]
     assert all(payload[key] == value for key, value in case.guard.items())
+    assert payload["initiative_artifact_ids"] == ["first", "second"]
     case.store.add_message.assert_not_awaited()
 
 
@@ -264,13 +265,18 @@ async def test_delivery_rejects_stale_or_missing_policy_decision(runtime, missin
 
 
 async def test_partial_delivery_retains_every_policy_guard_and_does_not_ack_fingerprint(runtime):
+    runtime.row["payload"]["initiative_artifact_ids"] = ["first", "second"]
     tail = {"_telegram_parts": [{"kind": "document", "path": "/synthetic/remaining.csv"}]}
     runtime.coordinator.transport.send.side_effect = PartialDeliveryError(
         [101], tail, TimeoutError()
     )
     assert await runtime.coordinator.delivery() is True
     args = runtime.conn.execute.await_args.args
-    assert args[3] == {**tail, **runtime.guard}
+    assert args[3] == {
+        **tail,
+        **runtime.guard,
+        "initiative_artifact_ids": ["first", "second"],
+    }
     assert args[4] == [101] and args[5] == "pending"
     runtime.store.delivery_result.assert_not_awaited()
 

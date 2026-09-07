@@ -178,6 +178,7 @@ class Coordinator:
                 "initiative_revision",
                 "initiative_project_revision",
                 "initiative_fingerprint",
+                "initiative_artifact_ids",
             ):
                 if key in payload:
                     remainder[key] = payload[key]
