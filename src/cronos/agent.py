@@ -26,6 +26,12 @@ from cronos.artifacts import ArtifactManager
 from cronos.capabilities import SKILLS, TOOLS, catalog_context
 from cronos.file_tasks import file_task
 from cronos.file_text import text_window
+from cronos.multimodal import (
+    clarification_before_image,
+    generated_image_ids,
+    image_references,
+    latest_image_references,
+)
 from cronos.privacy import confirmation_text
 from cronos.providers import Provider, ProviderError
 from cronos.settings import Settings
@@ -158,6 +164,7 @@ class Agent:
         user = await self.store.ensure_user(user_id)
         memories = await self.store.memories(user_id)
         history = await self.store.history(user_id, conversation["id"])
+        image_cache = {}
         files = await self.store.list_artifacts(user_id)
         schedules = await self.store.list_schedules(user_id)
         now = datetime.now(ZoneInfo(prefs.get("timezone", "UTC")))
@@ -189,6 +196,15 @@ dynamic=false годится только для отправки заранее
 Если timezone_confirmed отсутствует и человек не указал абсолютное время/часовой пояс, уточни пояс
 перед планированием. Не угадывай местоположение по языку. Изменение timezone подтверждает пояс.
 Для поиска используй web_search, а не придумывай результаты. Для чисел таблиц — table_analyze.
+Прикреплённые изображения передаются тебе вместе с текстом. Рассмотри ВСЕ изображения альбома:
+это один запрос, а не отдельные поручения. Не описывай второе изображение по первому.
+Для редактирования вызывай image_generate с artifact_ids нужных исходников и референсов;
+сохраняй композицию, персонажа и стиль исходника, меняй только то, что попросил пользователь.
+Если просят заменить пиджак на майку — сразу выполни это изменение, без вопроса о цвете и стиле.
+Несущественные детали выбирай по исходнику. Уточняй только когда без ответа нельзя выполнить запрос.
+Если задал такой уточняющий вопрос — закончи ход и дождись ответа; image_generate не вызывай.
+Не отправляй предварительный ответ перед генерацией. После успешного инструмента дай краткую
+подпись к изображению до 900 символов: она будет отправлена вместе с картинкой одним сообщением.
 Для сложного доказательства, многокритериального выбора или многошагового расчёта сам вызывай deep_reason;
 не включай дорогой reasoning для приветствий и простых вопросов.
 Не утверждай, что что-либо сохранил, отправил, создал или поменял, без успешного инструмента.
@@ -241,6 +257,8 @@ dynamic=false годится только для отправки заранее
 
                     async def preview(text):
                         nonlocal last_preview
+                        if not text or not text.strip():
+                            return
                         now = time.monotonic()
                         if now - last_preview < 1.5:
                             return
@@ -264,13 +282,20 @@ dynamic=false годится только для отправки заранее
                         and not scheduled
                         and self.transport is not None
                         and hasattr(self.transport, "draft")
+                        # Tool decisions for visual turns must not leak a question or
+                        # provisional answer before we know whether an image is being made.
+                        and not latest_image_references(state["messages"])
+                        and not generated_image_ids(state["messages"])
                         else {}
+                    )
+                    provider_messages = await self.visual_messages(
+                        user_id, state["messages"], image_cache
                     )
                     result = await self.paid(
                         run,
                         op,
                         lambda: self.provider.complete(
-                            [{"role": "system", "content": system}] + state["messages"],
+                            [{"role": "system", "content": system}] + provider_messages,
                             tools=tools,
                             model=model,
                             reasoning=reasoning,
@@ -287,6 +312,8 @@ dynamic=false годится только для отправки заранее
                     if key in {"role", "content", "tool_calls"}
                 }
                 clean.setdefault("role", "assistant")
+                if clarification_before_image(clean):
+                    clean.pop("tool_calls", None)
                 answer = clean.get("content") or ""
                 if (
                     not scheduled
@@ -334,6 +361,7 @@ dynamic=false годится только для отправки заранее
                                 conversation,
                                 scheduled=scheduled,
                                 proactive=proactive,
+                                image_context=latest_image_references(messages[:-1]),
                             )
                         except CancelledRun:
                             raise
@@ -396,15 +424,76 @@ dynamic=false годится только для отправки заранее
                 "answer": "",
             }
             if snapshot.values and not snapshot.next and snapshot.values.get("answer"):
-                return snapshot.values["answer"]
-            result = await compiled.ainvoke(
-                None if snapshot.next else initial, config, durability="sync"
-            )
+                return self.final_answer(snapshot.values)
+            try:
+                result = await compiled.ainvoke(
+                    None if snapshot.next else initial, config, durability="sync"
+                )
+            except ProviderError:
+                # A caption failure must not strand an already paid, saved image.
+                saved = await compiled.aget_state(config)
+                if not generated_image_ids(saved.values.get("messages", [])):
+                    raise
+                result = {**saved.values, "answer": "Готово — изображение подготовлено."}
             await self.active(run)
-            return (
-                result.get("answer")
-                or "Не получилось подготовить ответ. Попробуй переформулировать запрос."
+            return self.final_answer(result)
+
+    @staticmethod
+    def final_answer(state):
+        answer = (
+            state.get("answer")
+            or "Не получилось подготовить ответ. Попробуй переформулировать запрос."
+        )
+        images = generated_image_ids(state.get("messages", []))
+        return {"text": answer, "image_artifact_ids": images} if images else answer
+
+    async def visual_messages(self, user_id, messages, cache):
+        # Keep SQL/checkpoints small. Only the latest visual turn is hydrated;
+        # earlier artifacts stay addressable via image_analyze and image_generate.
+        selected = set(latest_image_references(messages))
+        result = []
+        for message in messages:
+            content = message.get("content")
+            refs = image_references(content)
+            if not refs:
+                result.append(message)
+                continue
+            parts = (
+                [{"type": "text", "text": content}]
+                if isinstance(content, str)
+                else [part for part in content if part.get("type") != "image_ref"]
             )
+            for artifact_id in refs:
+                parts.append({"type": "text", "text": f"Изображение artifact_id={artifact_id}"})
+                if artifact_id not in selected:
+                    continue
+                if artifact_id not in cache:
+                    artifact = await self.store.get_artifact(user_id, artifact_id)
+                    cache[artifact_id] = await asyncio.to_thread(
+                        image_data_url, artifact, preview=True
+                    )
+                parts.append({"type": "image_url", "image_url": {"url": cache[artifact_id]}})
+            # Chat completions expects input images in a user message, including
+            # a prior assistant-generated artifact now used as a reference.
+            if message.get("role") == "assistant":
+                text_parts = [part for part in parts if part.get("type") == "text"]
+                result.append({**message, "content": text_parts})
+                if any(part.get("type") == "image_url" for part in parts):
+                    result.append(
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": "Изображение из предыдущего ответа Cronos (контекст, не новое поручение).",
+                                },
+                                *parts,
+                            ],
+                        }
+                    )
+            else:
+                result.append({**message, "content": parts})
+        return result
 
     async def active(self, run):
         if not await self.store.run_active(run["id"], run["fence"]):
@@ -452,7 +541,18 @@ dynamic=false годится только для отправки заранее
         await self.active(run)
         return result
 
-    async def execute(self, name, args, op, run, conversation, *, scheduled=False, proactive=False):
+    async def execute(
+        self,
+        name,
+        args,
+        op,
+        run,
+        conversation,
+        *,
+        scheduled=False,
+        proactive=False,
+        image_context=None,
+    ):
         if proactive or (scheduled and name not in SCHEDULED_TOOL_NAMES):
             raise ValueError("Этот инструмент недоступен при выполнении данного задания.")
         user = run["user_id"]
@@ -591,25 +691,36 @@ dynamic=false годится только для отправки заранее
             )
             return {"text": result["message"].get("content", ""), "page": args.get("page", 1)}
         if name == "image_generate":
-            image_url = None
-            if args.get("artifact_id"):
-                artifact = await self.store.get_artifact(user, args["artifact_id"])
-                data, mime = await asyncio.to_thread(image_bytes, artifact, 1)
-                image_url = f"data:{mime};base64,{base64.b64encode(data).decode()}"
+            refs = args.get("artifact_ids")
+            if refs is None:
+                refs = [args["artifact_id"]] if args.get("artifact_id") else (image_context or [])
+            if not isinstance(refs, list) or any(not isinstance(ref, str) for ref in refs):
+                raise ValueError(
+                    "artifact_ids должен быть списком идентификаторов исходных изображений"
+                )
+            refs = list(dict.fromkeys(refs))
+            image_urls = []
+            for ref in refs:
+                artifact = await self.store.get_artifact(user, ref)
+                image_urls.append(await asyncio.to_thread(image_data_url, artifact))
             result = await self.paid(
-                run, op + ":usage", lambda: self.provider.generate_image(args["prompt"], image_url)
+                run,
+                op + ":usage",
+                lambda: self.provider.generate_image(args["prompt"], image_urls=image_urls),
             )
             artifact = await file_task(
                 self.artifacts.ingest,
                 user,
-                "cronos-image.jpg" if result["mime"] == "image/jpeg" else "cronos-image.png",
+                "cronos-image."
+                + {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp"}[result["mime"]],
                 result["data"],
             )
             await self.store.save_artifact(user, artifact)
-            await self.store.enqueue_for_run(
-                run, conversation, {"image_path": artifact["path"]}, op
-            )
-            return {"artifact_id": artifact["id"], "delivery": "queued"}
+            return {
+                "artifact_id": artifact["id"],
+                "delivery": "prepared",
+                "reference_artifact_ids": refs,
+            }
         if name == "topics_list":
             return await self.store.list_conversations(user)
         if name == "topic_create":
@@ -650,6 +761,23 @@ dynamic=false годится только для отправки заранее
         if name == "top_up":
             return await self.store.top_up(user, args["tokens"], op)
         raise ValueError("Этот навык пока недоступен")
+
+
+def image_data_url(artifact, *, preview=False):
+    data, mime = image_bytes(artifact, 1)
+    if preview or mime not in {"image/png", "image/jpeg", "image/webp"}:
+        import io
+
+        from PIL import Image, ImageOps
+
+        with Image.open(io.BytesIO(data)) as image:
+            image = ImageOps.exif_transpose(image)
+            if preview:
+                image.thumbnail((1536, 1536))
+            output = io.BytesIO()
+            image.convert("RGBA" if "A" in image.getbands() else "RGB").save(output, format="PNG")
+            data, mime = output.getvalue(), "image/png"
+    return f"data:{mime};base64,{base64.b64encode(data).decode()}"
 
 
 def image_bytes(artifact, page=1):

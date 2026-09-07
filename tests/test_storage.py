@@ -148,7 +148,8 @@ async def test_create_chat_with_real_store_persists_topic_result_and_deduplicate
     assert delivery["state"] == "pending"
     assert delivery["dedupe_key"] == f"topic-welcome:{A}:42"
     assert "Новый чат готов" in delivery["payload"]["text"]
-    assert delivery["payload"]["reply_markup"]["inline_keyboard"]
+    assert delivery["payload"]["reply_markup"]["keyboard"]
+    assert "inline_keyboard" not in delivery["payload"]["reply_markup"]
 
 
 async def test_rls_is_enforced_for_two_users_and_transaction_settings_do_not_leak(store):

@@ -4,14 +4,15 @@ import asyncio
 import logging
 import re
 import time
-from dataclasses import dataclass
+from collections import OrderedDict
+from dataclasses import dataclass, field
 from typing import Any, TypedDict
 from urllib.parse import urlsplit
 
 from aiogram import Bot
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
-from aiogram.types import FSInputFile, InlineKeyboardMarkup, InputRichMessage
+from aiogram.types import FSInputFile, InlineKeyboardMarkup, InputRichMessage, ReplyKeyboardMarkup
 from aiohttp_socks import ProxyConnectionError, ProxyError, ProxyTimeoutError
 
 from cronos.settings import Settings
@@ -19,6 +20,15 @@ from cronos.settings import Settings
 logger = logging.getLogger(__name__)
 _INLINE = re.compile(r"(`[^`\n]+`|\*\*[^*\n]+\*\*|\|\|[^|\n]+\|\||\[[^\]\n]+\]\([^\s)]+\))")
 _TOPIC_CAPABILITIES_TTL = 60.0
+_DRAFT_CACHE_LIMIT = 128
+_DRAFT_REQUEST_TIMEOUT = 3.0
+_THINKING_TEXT = "Думаю..."
+
+
+@dataclass
+class _DraftPreview:
+    text: str = _THINKING_TEXT
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
 @dataclass(frozen=True)
@@ -60,29 +70,37 @@ def upgrade_keyboard() -> dict:
     }
 
 
-def new_chat_keyboard() -> dict:
+def navigation_keyboard() -> dict:
+    """A collapsible input panel; its buttons arrive as ordinary text messages."""
     return {
-        "inline_keyboard": [
-            [{"text": "➕ Новый чат", "callback_data": "chat:new"}],
-            [{"text": "🗑 Удалить этот чат", "callback_data": "chat:delete"}],
-            [{"text": "🪐 Главное меню", "callback_data": "home:main"}],
-        ]
+        "keyboard": [
+            [{"text": "➕ Новый чат"}, {"text": "🗑 Удалить чат"}],
+            [{"text": "🪐 Главное меню"}],
+        ],
+        "resize_keyboard": True,
+        "is_persistent": False,
+        "one_time_keyboard": False,
     }
 
 
-def chat_navigation_keyboard(bot_username: str | None = None) -> dict:
-    """Open the bot itself; topic selection stays in Telegram's native topic list.
+def new_chat_keyboard() -> dict:
+    """Compatibility name for the shared bottom navigation panel."""
+    return navigation_keyboard()
 
-    https://core.telegram.org/api/links#forum-topic-links only documents
-    group/channel message links, not a private-bot topic navigation URL.
-    """
-    keyboard = new_chat_keyboard()
-    username = (bot_username or "").strip().removeprefix("@")
-    if re.fullmatch(r"[A-Za-z0-9_]{5,32}", username):
-        keyboard["inline_keyboard"].append(
-            [{"text": "Открыть Cronos", "url": f"https://t.me/{username}"}]
-        )
-    return keyboard
+
+def chat_navigation_keyboard(bot_username: str | None = None) -> dict:
+    """Topic selection stays in Telegram's native list, with no invented jump URL."""
+    return navigation_keyboard()
+
+
+def _reply_markup(value: dict | None) -> InlineKeyboardMarkup | ReplyKeyboardMarkup | None:
+    if not value:
+        return None
+    if "keyboard" in value:
+        if "inline_keyboard" in value:
+            raise ValueError("A Telegram message cannot have both keyboard types")
+        return ReplyKeyboardMarkup.model_validate(value)
+    return InlineKeyboardMarkup.model_validate(value)
 
 
 def _topic_name(name: str) -> str:
@@ -286,8 +304,10 @@ class TelegramTransport:
         self._topic_capabilities: TopicCapabilities | None = None
         self._topic_capabilities_checked_at = 0.0
         self._topic_capabilities_lock = asyncio.Lock()
+        self._drafts: OrderedDict[tuple[int, int, int], _DraftPreview] = OrderedDict()
 
     async def close(self):
+        self._drafts.clear()
         await self.bot.session.close()
 
     async def topic_capabilities(self, force_refresh: bool = False) -> TopicCapabilities:
@@ -321,7 +341,10 @@ class TelegramTransport:
         if parts is None and edit_message_id is not None:
             if type(edit_message_id) is not int or edit_message_id <= 0:
                 raise ValueError("A positive Telegram edit message ID is required")
-            if payload.get("document_path") or payload.get("image_path") or payload.get("caption"):
+            if any(
+                payload.get(key)
+                for key in ("document_path", "image_path", "image_paths", "caption")
+            ):
                 raise ValueError("An editable panel must contain only text and its keyboard")
             if await self._edit_panel(chat_id, edit_message_id, payload):
                 if payload.get("pin"):
@@ -332,16 +355,52 @@ class TelegramTransport:
             payload = {**payload, "format": "text"}
         if parts is None:
             rich = payload.get("format") == "rich"
-            parts = [
-                {"kind": "rich" if rich else "text", "text": chunk}
-                for chunk in split_text(str(payload.get("text") or ""), 12000 if rich else 3900)
-            ]
-            caption_parts = split_text(str(payload.get("caption") or ""), 1000)
-            caption = caption_parts[0] if caption_parts else None
-            for field, kind in (("document_path", "document"), ("image_path", "image")):
-                if payload.get(field):
-                    parts.append({"kind": kind, "path": payload[field], "caption": caption})
-            parts.extend({"kind": "text", "text": text} for text in caption_parts[1:])
+            text = str(payload.get("text") or "")
+            caption_text = str(payload.get("caption") or "")
+            image_paths = payload.get("image_paths") or []
+            if not isinstance(image_paths, list) or any(
+                not isinstance(path, str) or not path for path in image_paths
+            ):
+                raise ValueError("image_paths must be a list of nonempty file paths")
+            images = list(
+                dict.fromkeys(
+                    ([payload["image_path"]] if payload.get("image_path") else []) + image_paths
+                )
+            )
+            if images and not payload.get("document_path"):
+                # The answer belongs to the photo, not to a separate preceding bubble.
+                if text and caption_text and text != caption_text:
+                    caption_text = text + "\n\n" + caption_text
+                else:
+                    caption_text = text or caption_text
+                caption_parts = split_text(caption_text, 1024)
+                parts = [
+                    {
+                        "kind": "image",
+                        "path": path,
+                        "caption": caption_parts[0] if index == 0 and caption_parts else None,
+                    }
+                    for index, path in enumerate(images)
+                ]
+            else:
+                parts = [
+                    {"kind": "rich" if rich else "text", "text": chunk}
+                    for chunk in split_text(text, 12000 if rich else 3900)
+                ]
+                caption_parts = split_text(caption_text, 1024)
+                caption = caption_parts[0] if caption_parts else None
+                if payload.get("document_path"):
+                    parts.append(
+                        {"kind": "document", "path": payload["document_path"], "caption": caption}
+                    )
+                parts.extend(
+                    {"kind": "image", "path": path, "caption": caption if index == 0 else None}
+                    for index, path in enumerate(images)
+                )
+            # Do not truncate model output if it exceeds Telegram's caption limit.
+            parts.extend(
+                {"kind": "text", "text": text} for text in split_text("".join(caption_parts[1:]))
+            )
             if parts and payload.get("reply_markup"):
                 parts[-1]["reply_markup"] = payload["reply_markup"]
         else:
@@ -354,11 +413,7 @@ class TelegramTransport:
         while index < len(parts):
             part = parts[index]
             try:
-                markup = (
-                    InlineKeyboardMarkup.model_validate(part["reply_markup"])
-                    if part.get("reply_markup")
-                    else None
-                )
+                markup = _reply_markup(part.get("reply_markup"))
                 if part["kind"] == "rich":
                     try:
                         message = await self.bot.send_rich_message(
@@ -419,11 +474,11 @@ class TelegramTransport:
         text = str(payload.get("text") or "")
         if not text:
             raise ValueError("An editable panel must contain text")
-        markup = (
-            InlineKeyboardMarkup.model_validate(payload["reply_markup"])
-            if payload.get("reply_markup")
-            else None
-        )
+        markup = _reply_markup(payload.get("reply_markup"))
+        if isinstance(markup, ReplyKeyboardMarkup):
+            raise ValueError(
+                "Editable panels accept inline keyboards only; send bottom navigation separately"
+            )
         try:
             result = await self.bot.edit_message_text(
                 chat_id=chat_id,
@@ -462,15 +517,47 @@ class TelegramTransport:
             return False
 
     async def draft(self, chat_id: int, thread_id: int | None, text: str, draft_id: int):
+        key = (chat_id, thread_id or 0, draft_id or 1)
+        preview = self._drafts.get(key)
+        if preview is None:
+            preview = _DraftPreview()
+            self._drafts[key] = preview
+            while len(self._drafts) > _DRAFT_CACHE_LIMIT:
+                self._drafts.popitem(last=False)
+        self._drafts.move_to_end(key)
+        async with preview.lock:
+            if self._drafts.get(key) is not preview:
+                return
+            # A late initial heartbeat must not replace already streamed text.
+            if text.strip() and (text != _THINKING_TEXT or preview.text == _THINKING_TEXT):
+                preview.text = split_text(text)[0]
+            await self._send_draft(key, preview.text)
+
+    async def refresh_draft(self, chat_id: int, thread_id: int | None, draft_id: int):
+        key = (chat_id, thread_id or 0, draft_id or 1)
+        preview = self._drafts.get(key)
+        if preview is None:
+            return
+        async with preview.lock:
+            if self._drafts.get(key) is preview:
+                self._drafts.move_to_end(key)
+                await self._send_draft(key, preview.text)
+
+    def forget_draft(self, chat_id: int, thread_id: int | None, draft_id: int) -> None:
+        self._drafts.pop((chat_id, thread_id or 0, draft_id or 1), None)
+
+    async def _send_draft(self, key: tuple[int, int, int], text: str):
+        chat_id, thread_id, draft_id = key
         try:
-            await self.bot.send_message_draft(
-                chat_id=chat_id,
-                message_thread_id=thread_id or None,
-                draft_id=draft_id or 1,
-                text=(split_text(text) or [""])[0],
-                parse_mode=None,
-                can_stop=True,
-            )
+            async with asyncio.timeout(_DRAFT_REQUEST_TIMEOUT):
+                await self.bot.send_message_draft(
+                    chat_id=chat_id,
+                    message_thread_id=thread_id or None,
+                    draft_id=draft_id,
+                    text=text,
+                    parse_mode=None,
+                    can_stop=True,
+                )
         except (
             TelegramAPIError,
             TimeoutError,

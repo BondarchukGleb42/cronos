@@ -37,7 +37,7 @@ async def test_completed_answer_has_durable_final_message_after_ephemeral_previe
     case = worker_case
     await case.worker.answer(case.event, case.conversation, "Вопрос")
     case.worker.transport.draft.assert_awaited_once_with(
-        -920005, 3, "Сейчас разберусь…", case.run["id"].int % 2_000_000_000 + 1
+        -920005, 3, "Думаю...", case.run["id"].int % 2_000_000_000 + 1
     )
     args = case.worker.store.enqueue_for_run.call_args.args
     assert args[2] == {

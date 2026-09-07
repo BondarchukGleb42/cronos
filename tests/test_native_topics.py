@@ -112,13 +112,10 @@ async def test_native_topic_creation_preserves_owner_and_title_policy(implicit, 
     assert delivery[:3] == (OWNER_ID, OWNER_ID, THREAD_ID)
     assert delivery[4] == f"topic-welcome:{OWNER_ID}:{THREAD_ID}"
     assert ("Название появится после моего ответа" in delivery[3]["text"]) is not manual
-    callbacks = [
-        button["callback_data"]
-        for row in delivery[3]["reply_markup"]["inline_keyboard"]
-        for button in row
-    ]
-    assert "chat:new" in callbacks
-    assert "chat:delete" in callbacks
+    labels = [button["text"] for row in delivery[3]["reply_markup"]["keyboard"] for button in row]
+    assert "➕ Новый чат" in labels
+    assert "🗑 Удалить чат" in labels
+    assert "inline_keyboard" not in delivery[3]["reply_markup"]
 
 
 @pytest.mark.parametrize("kind", ["created", "edited"])

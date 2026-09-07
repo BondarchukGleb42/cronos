@@ -197,7 +197,5 @@ async def test_false_acknowledgement_is_not_reported_as_cleared(transport):
 
 
 def test_chat_keyboard_exposes_explicit_current_chat_deletion():
-    callbacks = [
-        button["callback_data"] for row in new_chat_keyboard()["inline_keyboard"] for button in row
-    ]
-    assert callbacks == ["chat:new", "chat:delete", "home:main"]
+    labels = [button["text"] for row in new_chat_keyboard()["keyboard"] for button in row]
+    assert labels == ["➕ Новый чат", "🗑 Удалить чат", "🪐 Главное меню"]

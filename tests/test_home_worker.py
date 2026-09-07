@@ -116,7 +116,7 @@ def callback(case, data, *, thread=77):
     }
 
 
-@pytest.mark.parametrize("text", ["/start", "/menu", "меню", "Главное меню"])
+@pytest.mark.parametrize("text", ["/start", "/menu", "меню", "Главное меню", "🪐 Главное меню"])
 async def test_menu_entrypoints_are_deterministic_and_never_call_agent(case, text):
     case.event["payload"]["message"]["text"] = text
     await case.worker.telegram(case.event)

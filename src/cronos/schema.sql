@@ -58,6 +58,8 @@ CREATE TABLE IF NOT EXISTS events (
   available_at timestamptz NOT NULL DEFAULT now(), notified_at timestamptz,
   attempts integer NOT NULL DEFAULT 0, error text, created_at timestamptz NOT NULL DEFAULT now()
 );
+ALTER TABLE events ADD COLUMN IF NOT EXISTS media_group_key text;
+CREATE INDEX IF NOT EXISTS events_media_group ON events(media_group_key,created_at DESC) WHERE media_group_key IS NOT NULL;
 CREATE INDEX IF NOT EXISTS events_pending ON events(state,available_at);
 -- Bootstrap active accounts only; an empty or currently erasing account stays untouched.
 -- The previous worker may still be running when the migration job executes.

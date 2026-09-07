@@ -15,6 +15,7 @@ from cronos.settings import Settings
 
 PLANS = {"FREE": 25_000_000, "START": 700_000_000, "PREMIUM": 1_700_000_000, "PRO": 3_700_000_000}
 HOME_TITLE = "🪐 Cronos"
+MEDIA_GROUP_DEBOUNCE_SECONDS = 2
 STOP_COMMANDS = {"стоп", "остановись", "отмена", "stop", "/stop"}
 
 
@@ -54,6 +55,14 @@ def telegram_message(update: dict) -> dict:
         if isinstance(update.get(key), dict):
             return update[key]
     return (update.get("callback_query") or {}).get("message") or {}
+
+
+def telegram_event_messages(update: dict) -> list[dict]:
+    messages = update.get("media_group_messages")
+    if isinstance(messages, list) and messages:
+        return [message for message in messages if isinstance(message, dict)]
+    message = telegram_message(update)
+    return [message] if message else []
 
 
 def telegram_owner(update: dict) -> int | None:
@@ -182,13 +191,24 @@ class Store:
                         original["update_id"],
                     )
                     continue
-                inserted = await conn.fetchval(
-                    """INSERT INTO events(id,update_id,payload) VALUES($1,$2,$3)
-                    ON CONFLICT(update_id) DO NOTHING RETURNING id""",
-                    uuid4(),
-                    update["update_id"],
-                    update,
-                )
+                if self._media_group_key(update) is not None:
+                    inserted = await self._ingest_media_group(conn, update)
+                else:
+                    album_key = await self._pending_media_group_for_text(conn, update)
+                    if album_key is not None:
+                        inserted = await self._ingest_media_group(
+                            conn, update, key=album_key, join_text=True
+                        )
+                        if inserted is not False:
+                            # Plain album instructions cannot be control commands.
+                            continue
+                    inserted = await conn.fetchval(
+                        """INSERT INTO events(id,update_id,payload) VALUES($1,$2,$3)
+                        ON CONFLICT(update_id) DO NOTHING RETURNING id""",
+                        uuid4(),
+                        update["update_id"],
+                        update,
+                    )
                 if not inserted:
                     continue
                 if privacy_confirmed:
@@ -233,6 +253,142 @@ class Store:
                 {"offset": next_offset},
             )
             return True
+
+    @staticmethod
+    def _media_group_key(update):
+        message = update.get("message") or {}
+        group_id = message.get("media_group_id")
+        chat = message.get("chat") or {}
+        owner = telegram_owner(update)
+        if (
+            not isinstance(group_id, str)
+            or not group_id
+            or owner is None
+            or not isinstance(chat.get("id"), int)
+            or not isinstance(message.get("message_id"), int)
+        ):
+            return None
+        scope = [owner, chat["id"], message.get("message_thread_id") or 0, group_id]
+        return hashlib.sha256(json.dumps(scope, separators=(",", ":")).encode()).hexdigest()
+
+    async def _pending_media_group_for_text(self, conn, update):
+        message = update.get("message") or {}
+        text = message.get("text")
+        if (
+            not isinstance(text, str)
+            or not text.strip()
+            or (message.get("from") or {}).get("is_bot")
+        ):
+            return None
+        command = message_command(text)
+        if (
+            command.startswith("/")
+            or command in STOP_COMMANDS
+            or text.strip().casefold().rstrip(".! ")
+            in {
+                "подтверждаю полную очистку",
+                "подтверждаю удаление чата",
+                "➕ новый чат",
+                "🗑 удалить чат",
+                "🪐 главное меню",
+            }
+        ):
+            return None
+        owner = telegram_owner(update)
+        chat_id = (message.get("chat") or {}).get("id")
+        if owner is None or not isinstance(chat_id, int):
+            return None
+        return await conn.fetchval(
+            """SELECT media_group_key FROM events WHERE media_group_key IS NOT NULL
+            AND state='pending' AND attempts=0 AND available_at>clock_timestamp()
+            AND payload->>'media_group_continuation' IS DISTINCT FROM 'true'
+            AND payload#>>'{message,chat,id}'=$1
+            AND COALESCE(payload#>>'{message,message_thread_id}','0')=$2
+            AND ((payload#>>'{message,chat,type}'='private' AND payload#>>'{message,chat,id}'=$3)
+                 OR payload#>>'{message,from,id}'=$3)
+            ORDER BY created_at DESC,id DESC LIMIT 1""",
+            str(chat_id),
+            str(message.get("message_thread_id") or 0),
+            str(owner),
+        )
+
+    async def _ingest_media_group(self, conn, update, *, key=None, join_text=False):
+        """False means a text no longer qualifies; None means an existing update receipt."""
+        key = key or self._media_group_key(update)
+        message = update["message"]
+        chat = message["chat"]
+        lock_key = int.from_bytes(
+            hashlib.blake2b(f"cronos:media-group:{key}".encode(), digest_size=8).digest(),
+            signed=True,
+        )
+        await conn.execute("SELECT pg_advisory_xact_lock($1::bigint)", lock_key)
+        previous = await conn.fetchrow(
+            """SELECT *,available_at>clock_timestamp() AS collecting_window FROM events
+            WHERE media_group_key=$1 ORDER BY created_at DESC,id DESC LIMIT 1 FOR UPDATE""",
+            key,
+        )
+        collecting = (
+            previous is not None and previous["state"] == "pending" and previous["attempts"] == 0
+        )
+        if join_text and (
+            not collecting
+            or not previous["collecting_window"]
+            or previous["payload"].get("media_group_continuation")
+        ):
+            return False
+        receipt_message = {
+            "message_id": message["message_id"],
+            "date": message.get("date"),
+            "message_thread_id": message.get("message_thread_id") or 0,
+            "chat": {"id": chat["id"], "type": chat.get("type")},
+            "from": {"id": (message.get("from") or {}).get("id")},
+        }
+        receipt = await conn.fetchval(
+            """INSERT INTO events(id,update_id,payload,state) VALUES($1,$2,$3,'done')
+            ON CONFLICT(update_id) DO NOTHING RETURNING id""",
+            uuid4(),
+            update["update_id"],
+            {
+                "update_id": update["update_id"],
+                "message": receipt_message,
+                "media_group_receipt": True,
+            },
+        )
+        if receipt is None:
+            return None
+        messages = telegram_event_messages(previous["payload"]) if previous else []
+        if any(item.get("message_id") == message["message_id"] for item in messages):
+            return receipt
+        messages = sorted([*messages, message], key=lambda item: item["message_id"])
+        primary = next((item for item in messages if (item.get("caption") or "").strip()), None)
+        if primary is None:
+            primary = next(
+                (item for item in messages if (item.get("text") or "").strip()), messages[0]
+            )
+        payload = dict(previous["payload"] if collecting else update)
+        payload["message"] = primary
+        payload["media_group_messages"] = messages
+        if previous and not collecting:
+            # Do not mutate a run's input after it may have made paid requests.
+            payload["media_group_continuation"] = True
+        if collecting:
+            await conn.execute(
+                """UPDATE events SET payload=$2,available_at=clock_timestamp()+$3*interval '1 second',
+                notified_at=NULL WHERE id=$1""",
+                previous["id"],
+                payload,
+                MEDIA_GROUP_DEBOUNCE_SECONDS,
+            )
+        else:
+            await conn.execute(
+                """INSERT INTO events(id,payload,media_group_key,available_at)
+                VALUES($1,$2,$3,clock_timestamp()+$4*interval '1 second')""",
+                uuid4(),
+                payload,
+                key,
+                MEDIA_GROUP_DEBOUNCE_SECONDS,
+            )
+        return receipt
 
     async def _ingress_privacy(self, conn, update):
         user_id = telegram_owner(update)
@@ -673,20 +829,21 @@ class Store:
                 if not targeted or candidate["id"] == uid(event_id):
                     continue
                 event_ids.add(candidate["id"])
-                if message and (message.get("chat") or {}).get("id") == request["chat_id"]:
-                    if thread > 1 and full:
-                        topic_ids.add(thread)
-                    message_date = message.get("date")
+                for item in telegram_event_messages(payload):
+                    if (item.get("chat") or {}).get("id") != request["chat_id"]:
+                        continue
+                    item_thread = item.get("message_thread_id") or 0
+                    if item_thread > 1 and full:
+                        topic_ids.add(item_thread)
+                    message_date = item.get("date")
                     if (
-                        thread in {0, 1}
-                        and isinstance(message.get("message_id"), int)
+                        item_thread in {0, 1}
+                        and isinstance(item.get("message_id"), int)
                         and isinstance(message_date, (int, float))
                         and message_date + deletion_window > now_seconds
                     ):
-                        general_ids.add(message["message_id"])
-                        general_deadlines[str(message["message_id"])] = (
-                            message_date + deletion_window
-                        )
+                        general_ids.add(item["message_id"])
+                        general_deadlines[str(item["message_id"])] = message_date + deletion_window
             request_tokens = [str(request["id"]), request["id"].hex]
             linked = [str(value) for value in event_ids | set(run_ids)] + request_tokens
             deliveries = await conn.fetch("SELECT * FROM outbox WHERE user_id=$1 FOR UPDATE", owner)
@@ -1478,7 +1635,10 @@ class Store:
 
     async def notified(self, event_id):
         async with self.connection() as conn:
-            await conn.execute("UPDATE events SET notified_at=now() WHERE id=$1", uid(event_id))
+            await conn.execute(
+                "UPDATE events SET notified_at=now() WHERE id=$1 AND state='pending' AND available_at<=now()",
+                uid(event_id),
+            )
 
     async def enqueue(
         self, user_id: int, chat_id: int, thread_id: int | None, payload: dict, dedupe_key: str

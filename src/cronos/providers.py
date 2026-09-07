@@ -469,7 +469,9 @@ class Provider:
                     isinstance(part, dict) and part.get("type") == "image_url" for part in content
                 )
         fallbacks = [m.strip() for m in self.settings.model_fallbacks.split(",") if m.strip()]
-        if has_image and (not model or model in [self.settings.model_free, *fallbacks]):
+        if has_image:
+            # MODEL_VISION is the configured image-capable route. An explicit
+            # text/reasoning model must not accidentally receive image history.
             model = self.settings.model_vision
         selected = model or (
             self.settings.model_reasoning
@@ -479,7 +481,8 @@ class Provider:
             else self.settings.model_free
         )
         if (
-            reasoning
+            not has_image
+            and reasoning
             and selected in [self.settings.model_free, *fallbacks]
             and selected not in REASONING_MODELS
         ):
@@ -496,7 +499,7 @@ class Provider:
         if reasoning or selected in REASONING_MODELS:
             payload["extra_body"] = {"reasoning": {"enabled": reasoning}}
         if has_image:
-            chain = [selected, self.settings.model_vision, self.settings.model_vision]
+            chain = [self.settings.model_vision] * 3
         elif tools:
             chain = [selected, self.settings.model_tools, self.settings.model_tools]
         elif selected == self.settings.model_free and not reasoning:
@@ -700,16 +703,56 @@ class Provider:
         }
 
     async def generate_image(
-        self, prompt: str, image_data_url: str | None = None
+        self,
+        prompt: str,
+        image_data_url: str | None = None,
+        *,
+        image_urls: list[str] | None = None,
     ) -> dict[str, Any]:
-        content: Any = prompt
-        if image_data_url:
-            if not image_data_url.startswith("data:image/"):
+        """Generate or edit through Chat Completions, preserving every reference.
+
+        The legacy single-image argument remains supported. Private artifacts are
+        supplied inline; this adapter neither fetches nor forwards remote URLs.
+        """
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ProviderError("An image prompt is required.")
+        if image_data_url is not None and image_urls is not None:
+            raise ProviderError("Pass either image_urls or image_data_url, not both.")
+        if image_urls is not None and not isinstance(image_urls, list):
+            raise ProviderError("Image inputs must be a list of inline image data URLs.")
+        references = [image_data_url] if image_data_url is not None else list(image_urls or [])
+        # Gemini 3 image models support up to 14 references. Never truncate them:
+        # a provider-specific lower limit must fail the edit, not change its inputs.
+        if len(references) > 14:
+            raise ProviderError("At most 14 image references are supported.")
+        for reference in references:
+            if not isinstance(reference, str):
                 raise ProviderError("Image input must be an inline image data URL.")
+            header, separator, encoded = reference.partition(",")
+            if not separator or header not in {
+                "data:image/png;base64",
+                "data:image/jpeg;base64",
+                "data:image/webp;base64",
+            }:
+                raise ProviderError("Image input must be an inline PNG, JPEG or WebP data URL.")
+            try:
+                if not base64.b64decode(encoded, validate=True):
+                    raise ValueError("Empty image")
+            except ValueError, binascii.Error:
+                raise ProviderError("Image input contains invalid or empty base64 data.") from None
+        content: Any = prompt
+        image_config = {"image_size": "1K"}
+        if references:
             content = [
                 {"type": "text", "text": prompt},
-                {"type": "image_url", "image_url": {"url": image_data_url}},
+                *[
+                    {"type": "image_url", "image_url": {"url": reference}}
+                    for reference in references
+                ],
             ]
+        else:
+            # Edits can retain the input composition instead of being forced square.
+            image_config["aspect_ratio"] = "1:1"
         result = await self._completion(
             {
                 "messages": [{"role": "user", "content": content}],
@@ -717,13 +760,15 @@ class Provider:
                 "stream": False,
                 "extra_body": {
                     "modalities": ["image", "text"],
-                    "image_config": {"image_size": "1K", "aspect_ratio": "1:1"},
+                    "image_config": image_config,
                 },
             },
             [self.settings.model_image] * 3,
         )
-        for image in result["message"].get("images") or []:
-            url = image.get("image_url", {}).get("url", "")
+        images = result["message"].get("images")
+        for image in images if isinstance(images, list) else []:
+            image_url = image.get("image_url") if isinstance(image, dict) else None
+            url = image_url.get("url") if isinstance(image_url, dict) else None
             if not isinstance(url, str) or not url.startswith("data:image/"):
                 continue
             try:
@@ -737,7 +782,9 @@ class Provider:
                     continue
                 if len(encoded) > 28_000_000:
                     raise ProviderError(
-                        "Generated image exceeds the size limit.", usage=result["usage"]
+                        "Generated image exceeds the size limit.",
+                        usage=result["usage"],
+                        attempts=result["attempts"],
                     )
                 data = base64.b64decode(encoded, validate=True)
                 if data:
@@ -750,7 +797,9 @@ class Provider:
             except ValueError, binascii.Error:
                 continue
         raise ProviderError(
-            "The provider returned no supported inline image.", usage=result["usage"]
+            "The provider returned no supported inline image.",
+            usage=result["usage"],
+            attempts=result["attempts"],
         )
 
     async def catalog(self) -> list[dict[str, Any]]:

@@ -33,10 +33,18 @@ from cronos.privacy import (
 from cronos.providers import Provider, ProviderError
 from cronos.settings import get_settings
 from cronos.storage import STOP_COMMANDS, Store, message_command
-from cronos.telegram import TelegramTransport, new_chat_keyboard
+from cronos.telegram import TelegramTransport, navigation_keyboard
 from cronos.topics import create_chat, welcome_topic
 
 log = logging.getLogger(__name__)
+
+
+def navigation_command(text):
+    return {
+        "➕ Новый чат": "/new",
+        "🗑 Удалить чат": "/delete",
+        "🪐 Главное меню": "/menu",
+    }.get(text.strip(), text)
 
 
 class Worker:
@@ -151,11 +159,13 @@ class Worker:
             if not current:
                 return
             update = current["payload"]
+            event = current
             callback = update.get("callback_query")
             message = update.get("message") or (callback or {}).get("message")
             if not message:
                 return
             text = message.get("text") or message.get("caption") or ""
+            text = navigation_command(text)
             if await self.privacy_control(event, user_id, chat_id, thread_id, text, callback):
                 return
             if await self.home_control(event, user_id, chat_id, thread_id, text, callback):
@@ -176,7 +186,6 @@ class Worker:
                     await self.new_chat(event, conversation)
                     return
                 return
-            text = message.get("text") or message.get("caption") or ""
             command = message_command(text)
             if command in {"/delete", "/clearall"}:
                 await self.request_deletion(
@@ -207,11 +216,29 @@ class Worker:
                 )
                 return
             attachments = []
-            document = message.get("document")
-            if document:
-                attachments.append((document["file_id"], document.get("file_name", "document.bin")))
-            if message.get("photo"):
-                attachments.append((message["photo"][-1]["file_id"], "photo.jpg"))
+            media_messages = update.get("media_group_messages") or [message]
+            if any(
+                item.get("chat", {}).get("id") != chat_id
+                or item.get("from", {}).get("id") != user_id
+                or item.get("message_thread_id", 0) != thread_id
+                for item in media_messages
+            ):
+                raise ValueError("Album messages must belong to one user and conversation")
+            if update.get("media_group_messages"):
+                text = "\n\n".join(
+                    item.get("caption") or item.get("text") or ""
+                    for item in media_messages
+                    if item.get("caption") or item.get("text")
+                )
+            for item in media_messages:
+                document = item.get("document")
+                if document:
+                    attachments.append(
+                        (document["file_id"], document.get("file_name", "document.bin"))
+                    )
+                if item.get("photo"):
+                    attachments.append((item["photo"][-1]["file_id"], "photo.jpg"))
+            image_refs, attachment_failed = [], False
             for file_id, filename in attachments:
                 op = f"attachment:{event['id']}:{file_id}"
                 artifact = await self.store.operation(op)
@@ -238,6 +265,7 @@ class Worker:
                                 artifact,
                             )
                     except Exception as error:
+                        attachment_failed = True
                         log.warning("Attachment failed: %s", type(error).__name__)
                         await self.store.enqueue(
                             user_id,
@@ -250,10 +278,31 @@ class Worker:
                         )
                         continue
                 text += f"\n[Пользователь приложил файл: {artifact['filename']}, artifact_id={artifact['id']}, mime={artifact['mime']}]"
+                if artifact["mime"].startswith("image/"):
+                    image_refs.append({"type": "image_ref", "artifact_id": str(artifact["id"])})
+            # Generating from only a fraction of the supplied references changes the task.
+            if attachment_failed:
+                return
             if not text:
                 return
+            prompt = [{"type": "text", "text": text}, *image_refs] if image_refs else text
+            if update.get("media_group_continuation"):
+                await self.store.add_message(
+                    user_id, conversation["id"], "user", prompt, f"user:{event['id']}"
+                )
+                await self.store.enqueue(
+                    user_id,
+                    chat_id,
+                    thread_id,
+                    {
+                        "text": "Остальные вложения альбома пришли позже начала ответа. Теперь весь набор сохранён в этом чате. Напиши, как продолжить — учту все изображения.",
+                        "reply_markup": navigation_keyboard(),
+                    },
+                    f"album-continuation:{event['id']}",
+                )
+                return
             await self.store.queue_home(user_id)
-            await self.answer(event, conversation, text)
+            await self.answer(event, conversation, prompt)
 
     async def home_init(self, event):
         user_id = event["payload"]["user_id"]
@@ -394,7 +443,10 @@ class Worker:
                 user_id,
                 chat_id,
                 thread_id,
-                {"text": "Меню открыто в чате 🪐 Cronos. Выбери его в списке чатов Telegram."},
+                {
+                    "text": "Меню открыто в чате 🪐 Cronos. Выбери его в списке чатов Telegram.",
+                    "reply_markup": navigation_keyboard(),
+                },
                 f"home-location:{event['id']}",
             )
         return True
@@ -473,9 +525,7 @@ class Worker:
             conversation["thread_id"],
             {
                 "text": text,
-                "reply_markup": main_panel()["reply_markup"]
-                if conversation.get("is_home")
-                else new_chat_keyboard(),
+                "reply_markup": navigation_keyboard(),
             },
             f"new-chat-result:{event['id']}",
         )
@@ -549,18 +599,35 @@ class Worker:
         started, cpu = time.monotonic(), time.process_time()
         status = "failed"
         interactive = not proactive and schedule is None
+        draft_id = run["id"].int % 2_000_000_000 + 1
+        draft_heartbeat = None
         try:
             if interactive:
                 await self.transport.draft(
                     conversation["chat_id"],
                     conversation["thread_id"],
-                    "Сейчас разберусь…",
-                    run["id"].int % 2_000_000_000 + 1,
+                    "Думаю...",
+                    draft_id,
                 )
-            answer = await self.agent.run(
+                if hasattr(self.transport, "refresh_draft"):
+                    draft_heartbeat = asyncio.create_task(
+                        self.refresh_preview(run, conversation, draft_id)
+                    )
+            result = await self.agent.run(
                 run, conversation, prompt, proactive=proactive, scheduled=schedule is not None
             )
+            if draft_heartbeat:
+                await cancel_tasks([draft_heartbeat])
+                draft_heartbeat = None
+            answer = result["text"] if isinstance(result, dict) else result
+            image_ids = result.get("image_artifact_ids", []) if isinstance(result, dict) else []
             payload = {"text": answer, "format": "rich"}
+            if image_ids:
+                images = [
+                    await self.store.get_artifact(conversation["user_id"], artifact_id)
+                    for artifact_id in image_ids
+                ]
+                payload = {"image_paths": [image["path"] for image in images], "caption": answer}
             privacy_request = (
                 await self.store.privacy_request_for_run(run["id"]) if interactive else None
             )
@@ -568,9 +635,7 @@ class Worker:
                 payload["reply_markup"] = (
                     confirmation_keyboard(privacy_request)
                     if privacy_request
-                    else main_panel()["reply_markup"]
-                    if conversation.get("is_home")
-                    else new_chat_keyboard()
+                    else navigation_keyboard()
                 )
             if schedule:
                 payload["schedule_id"] = str(schedule["id"])
@@ -595,7 +660,15 @@ class Worker:
                         conversation["user_id"],
                         conversation["id"],
                         "assistant",
-                        answer,
+                        [
+                            {"type": "text", "text": answer},
+                            *[
+                                {"type": "image_ref", "artifact_id": image_id}
+                                for image_id in image_ids
+                            ],
+                        ]
+                        if image_ids
+                        else answer,
                         f"assistant:{event['id']}",
                     )
                 else:
@@ -645,6 +718,12 @@ class Worker:
                 )
             await self.store.enqueue_for_run(run, conversation, payload, f"answer:{event['id']}")
         finally:
+            if draft_heartbeat:
+                await cancel_tasks([draft_heartbeat])
+            if interactive and hasattr(self.transport, "forget_draft"):
+                self.transport.forget_draft(
+                    conversation["chat_id"], conversation["thread_id"], draft_id
+                )
             await self.store.finish_run(run["id"], status, fence=run["fence"])
             rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
             await self.store.run_metrics(
@@ -655,6 +734,15 @@ class Worker:
                 rss if os.uname().sysname == "Darwin" else rss * 1024,
             )
         return status
+
+    async def refresh_preview(self, run, conversation, draft_id):
+        while True:
+            await asyncio.sleep(4)
+            if not await self.store.run_active(run["id"], run["fence"]):
+                return
+            await self.transport.refresh_draft(
+                conversation["chat_id"], conversation["thread_id"], draft_id
+            )
 
     async def timer(self, event):
         data = event["payload"]

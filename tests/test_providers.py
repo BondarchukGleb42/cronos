@@ -159,7 +159,7 @@ async def test_explicit_tools_model_falls_back_to_verified_tools_model(selected)
         await p.close()
 
 
-async def test_explicit_vision_model_falls_back_to_verified_vision_route():
+async def test_image_content_uses_only_configured_vision_route_even_with_explicit_model():
     requests = []
 
     def handler(request):
@@ -185,7 +185,7 @@ async def test_explicit_vision_model_falls_back_to_verified_vision_route():
             ],
             model="custom/vision-model",
         )
-        assert [body["model"] for body in requests] == ["custom/vision-model", "qwen/qwen3.7-flash"]
+        assert [body["model"] for body in requests] == ["qwen/qwen3.7-flash"] * 2
         assert requests[1]["messages"] == requests[0]["messages"]
     finally:
         await p.close()
