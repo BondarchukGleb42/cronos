@@ -87,6 +87,16 @@ class Coordinator:
     async def deliver_claimed(self, row):
         payload = row["payload"]
         try:
+            if payload.get("initiative_id") and not await self.store.validate_initiative_delivery(
+                row["user_id"], payload
+            ):
+                await self.store.delivery_result(
+                    row["id"],
+                    self.owner,
+                    error="Prepared initiative no longer authorized",
+                    permanent=True,
+                )
+                return True
             if payload.get("schedule_id"):
                 schedule = await self.store.get_schedule(payload["schedule_id"])
                 if (
@@ -96,6 +106,17 @@ class Coordinator:
                 ):
                     await self.store.delivery_result(
                         row["id"], self.owner, error="Cancelled schedule", permanent=True
+                    )
+                    return True
+                if schedule.get("initiative_id") and (
+                    str(schedule["initiative_id"]) != payload.get("initiative_id")
+                    or not await self.store.validate_initiative_delivery(row["user_id"], payload)
+                ):
+                    await self.store.delivery_result(
+                        row["id"],
+                        self.owner,
+                        error="Prepared initiative decision missing",
+                        permanent=True,
                     )
                     return True
                 if schedule["proactive"]:
@@ -149,7 +170,15 @@ class Coordinator:
         except PartialDeliveryError as error:
             # Persist acknowledged parts before retrying only the remainder.
             remainder = {**error.remaining_payload}
-            for key in ("schedule_id", "schedule_revision"):
+            for key in (
+                "schedule_id",
+                "schedule_revision",
+                "initiative_id",
+                "initiative_decision_id",
+                "initiative_revision",
+                "initiative_project_revision",
+                "initiative_fingerprint",
+            ):
                 if key in payload:
                     remainder[key] = payload[key]
             ids = (row.get("telegram_ids") or []) + error.sent_ids

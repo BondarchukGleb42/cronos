@@ -2,7 +2,7 @@ import asyncio
 import hashlib
 import json
 import re
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -11,6 +11,12 @@ from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 import asyncpg
 from dateutil.relativedelta import relativedelta
 
+from cronos.initiative import (
+    InitiativeStoreMixin,
+    invalidate_initiative_context,
+    mark_initiative_sent,
+    validate_initiative_payload,
+)
 from cronos.library import LibraryStoreMixin
 from cronos.memory import MemoryStoreMixin
 from cronos.memory_privacy import invalidate_memory_context
@@ -92,6 +98,7 @@ class Store(
     VersionsStoreMixin,
     WorkflowsStoreMixin,
     RecipesStoreMixin,
+    InitiativeStoreMixin,
 ):
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -1141,8 +1148,15 @@ class Store(
             return dict(await conn.fetchrow("SELECT * FROM users WHERE user_id=$1", user_id))
 
     async def preferences(self, user_id: int, values: dict | None = None):
+        if values:
+            for name in ("proactivity", "home_suggestions"):
+                if name in values and not isinstance(values[name], bool):
+                    raise ValueError(f"{name} must be a boolean")
         await self.ensure_user(user_id)
-        async with self.connection(user_id) as conn:
+        async with AsyncExitStack() as stack:
+            if values:
+                await stack.enter_async_context(self.user_lock(user_id, purpose="delivery"))
+            conn = await stack.enter_async_context(self.connection(user_id))
             if values:
                 await conn.execute(
                     "UPDATE users SET preferences=preferences||$2::jsonb WHERE user_id=$1",
@@ -1161,7 +1175,7 @@ class Store(
         if not isinstance(enabled, bool):
             raise ValueError("Инициативность должна быть включена или выключена")
         await self.ensure_user(user_id)
-        async with self.connection(user_id) as conn:
+        async with self.user_lock(user_id, purpose="delivery"), self.connection(user_id) as conn:
             await conn.fetchval("SELECT user_id FROM users WHERE user_id=$1 FOR UPDATE", user_id)
             existing = await conn.fetchrow("SELECT * FROM operations WHERE id=$1", source_key)
             if existing:
@@ -1579,6 +1593,7 @@ class Store(
                 matches,
             )
             await invalidate_memory_context(conn, user_id)
+            await invalidate_initiative_context(conn, user_id)
             # Rotating all active context prevents facts returning through a checkpoint or paraphrase.
             await conn.execute("UPDATE messages SET excluded=true WHERE user_id=$1", user_id)
             conversations = await conn.fetch(
@@ -1763,7 +1778,7 @@ class Store(
         except TypeError, ValueError:
             return None
         return await conn.fetchrow(
-            """SELECT id,revision,chat_id,thread_id FROM schedules
+            """SELECT id,revision,chat_id,thread_id,initiative_id FROM schedules
             WHERE id=$1 AND user_id=$2 AND revision=$3 AND state<>'cancelled'
             AND conversation_id=$4 FOR SHARE""",
             schedule_id,
@@ -1815,6 +1830,13 @@ class Store(
                     "schedule_id": str(schedule["id"]),
                     "schedule_revision": schedule["revision"],
                 }
+                if schedule["initiative_id"] and (
+                    payload.get("initiative_id") != str(schedule["initiative_id"])
+                    or not await validate_initiative_payload(conn, user_id, payload)
+                ):
+                    return None
+            elif payload.get("initiative_id"):
+                return None
             return await conn.fetchval(
                 """INSERT INTO outbox(user_id,chat_id,thread_id,payload,dedupe_key)
                 VALUES($1,$2,$3,$4,$5) ON CONFLICT(dedupe_key) DO UPDATE
@@ -1848,10 +1870,11 @@ class Store(
         permanent=False,
     ):
         async with self.connection() as conn:
-            await conn.execute(
+            acknowledged = await conn.fetchrow(
                 """UPDATE outbox SET state=$3,telegram_ids=COALESCE($4,telegram_ids),error=$5,
                 sent_at=CASE WHEN $4::jsonb IS NOT NULL THEN now() ELSE sent_at END,
-                next_attempt_at=now()+$6*interval '1 second',lease_until=NULL WHERE id=$1 AND owner=$2""",
+                next_attempt_at=now()+$6*interval '1 second',lease_until=NULL WHERE id=$1 AND owner=$2
+                RETURNING user_id,payload""",
                 delivery_id,
                 owner,
                 "sent" if ids is not None else ("failed" if permanent else "pending"),
@@ -1859,6 +1882,11 @@ class Store(
                 error,
                 retry_after,
             )
+            if ids is not None and acknowledged and acknowledged["payload"].get("initiative_id"):
+                await conn.execute(
+                    "SELECT set_config('app.user_id',$1,true)", str(acknowledged["user_id"])
+                )
+                await mark_initiative_sent(conn, acknowledged["payload"])
 
     async def start_run(self, event_id, user_id, conversation_id):
         user = await self.ensure_user(user_id)
@@ -2227,7 +2255,7 @@ class Store(
     async def list_schedules(self, user_id):
         async with self.connection() as conn:
             rows = await conn.fetch(
-                "SELECT id,due_at,fixed_text,instruction,dynamic,proactive,interval_seconds,timezone,state FROM schedules WHERE user_id=$1 AND state='active' ORDER BY due_at",
+                "SELECT id,due_at,fixed_text,instruction,dynamic,proactive,interval_seconds,timezone,state,initiative_id FROM schedules WHERE user_id=$1 AND state='active' ORDER BY due_at",
                 user_id,
             )
             return [
@@ -2235,7 +2263,7 @@ class Store(
             ]
 
     async def change_schedule(self, user_id, schedule_id, action, due_at=None):
-        async with self.connection() as conn:
+        async with self.user_lock(user_id, purpose="delivery"), self.connection() as conn:
             if action == "cancel":
                 changed = await conn.fetchval(
                     "UPDATE schedules SET state='cancelled',revision=revision+1 WHERE id=$1 AND user_id=$2 RETURNING id",
@@ -2378,6 +2406,7 @@ async def migrate(settings: Settings):
             await conn.execute(Path(__file__).with_name("versions.sql").read_text())
             await conn.execute(Path(__file__).with_name("workflows.sql").read_text())
             await conn.execute(Path(__file__).with_name("recipes.sql").read_text())
+            await conn.execute(Path(__file__).with_name("initiative.sql").read_text())
     finally:
         await conn.close()
 

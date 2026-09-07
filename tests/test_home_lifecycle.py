@@ -92,7 +92,8 @@ class MemoryStore:
 
 
 @pytest.fixture
-def case():
+def case(monkeypatch):
+    monkeypatch.setattr("cronos.home.personal_main_panel", AsyncMock(return_value=main_panel()))
     return SimpleNamespace(
         store=MemoryStore(),
         transport=SimpleNamespace(

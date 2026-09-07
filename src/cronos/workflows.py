@@ -9,7 +9,15 @@ from uuid import uuid4
 import asyncpg
 from pydantic import BaseModel, ConfigDict, Field, FiniteFloat, StringConstraints
 
-from cronos.projects import _change, _origin, _owner_lock, _project_row, _source_key, _uid
+from cronos.projects import (
+    _change,
+    _origin,
+    _owner_lock,
+    _project_row,
+    _source_key,
+    _uid,
+    serialize_project_delivery,
+)
 
 Text = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 PositiveInt = Annotated[int, Field(gt=0)]
@@ -639,6 +647,7 @@ class WorkflowsStoreMixin:
         """Implemented by Store as an owner-scoped transaction."""
         raise NotImplementedError
 
+    @serialize_project_delivery
     async def workflow_start(self, user_id: int, project_id, args: dict, source_key: str, run=None):
         _args(
             args,
@@ -720,6 +729,7 @@ class WorkflowsStoreMixin:
         async with self.connection(user_id) as conn:
             return await _detail(conn, user_id, _uid(project_id), limit, offset)
 
+    @serialize_project_delivery
     async def workflow_observe(
         self, user_id: int, project_id, args: dict, source_key: str, run=None
     ):
@@ -772,11 +782,12 @@ class WorkflowsStoreMixin:
             )
             if updated is None:
                 raise WorkflowRevisionConflict("Workflow changed; reload its current revision")
+            observation_id = uuid4()
             await conn.execute(
                 """INSERT INTO workflow_observations
                 (id,user_id,project_id,workflow_id,revision,observation,observed_at,origin_conversation_id,run_id)
                 VALUES($1,$2,$3,$4,$5,$6,COALESCE($7,clock_timestamp()),$8,$9)""",
-                uuid4(),
+                observation_id,
                 user_id,
                 project_id,
                 current["id"],
@@ -786,9 +797,26 @@ class WorkflowsStoreMixin:
                 origin,
                 run_id,
             )
+            project_revision = await conn.fetchval(
+                "UPDATE projects SET revision=revision+1,updated_at=clock_timestamp() WHERE user_id=$1 AND id=$2 RETURNING revision",
+                user_id,
+                project_id,
+            )
+            await _change(
+                conn,
+                user_id,
+                project_id,
+                project_revision,
+                "update",
+                "workflow-observe:" + source_key,
+                origin,
+                run_id,
+                {"workflow_observation_id": str(observation_id)},
+            )
             await _receipt(conn, user_id, source_key, updated, "observe", origin, run_id)
             return await _detail(conn, user_id, project_id)
 
+    @serialize_project_delivery
     async def workflow_replan(
         self, user_id: int, project_id, args: dict, source_key: str, run=None
     ):

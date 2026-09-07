@@ -23,9 +23,16 @@ from cronos.action_confirmation import (
     needs_schedule_repair,
 )
 from cronos.artifacts import ArtifactManager
-from cronos.capabilities import SKILLS, TOOLS, catalog_context
+from cronos.capabilities import INITIATIVE_DECISION_SCHEMAS, SKILLS, TOOLS, catalog_context
 from cronos.file_tasks import file_task
 from cronos.file_text import text_window
+from cronos.initiative import INITIATIVE_ALLOWED_TOOLS
+from cronos.initiative_tools import (
+    INITIATIVE_TOOL_NAMES,
+    execute_initiative_tool,
+    initiative_result,
+    scope_initiative_tool,
+)
 from cronos.library_tools import LIBRARY_TOOL_NAMES, execute_library_tool, recall_query
 from cronos.memory_tools import MEMORY_TOOL_NAMES, execute_memory_tool
 from cronos.multimodal import (
@@ -86,7 +93,16 @@ SCHEDULED_TOOL_NAMES = frozenset(
 )
 
 
-def available_tools(*, scheduled: bool = False, proactive: bool = False) -> list[dict] | None:
+def available_tools(
+    *, scheduled: bool = False, proactive: bool = False, initiative=None
+) -> list[dict] | None:
+    if initiative is not None:
+        if not proactive or not scheduled or not initiative.get("available"):
+            return None
+        allowed = INITIATIVE_ALLOWED_TOOLS.intersection(initiative.get("allowed_tools", []))
+        return [
+            tool for tool in TOOLS if tool["function"]["name"] in allowed
+        ] + INITIATIVE_DECISION_SCHEMAS
     if proactive:
         return None
     if scheduled:
@@ -104,13 +120,37 @@ def schedule_tool_results(messages: list[dict]) -> list[dict]:
                 calls[call.get("id")] = call.get("function", {}).get("name")
         elif message.get("role") == "tool":
             name = calls.get(message.get("tool_call_id"))
-            if name not in {"schedule_create", "schedule_change"}:
+            if name not in {
+                "schedule_create",
+                "schedule_change",
+                "initiative_configure",
+                "initiative_feedback",
+            }:
                 continue
             try:
                 result = json.loads(message.get("content", ""))
             except TypeError, ValueError:
                 continue
             if isinstance(result, dict):
+                if name == "initiative_configure":
+                    name = "schedule_create"
+                    result = (
+                        {**result, "id": result.get("schedule_id")}
+                        if result.get("available")
+                        else {"error": "Initiative configuration is unavailable"}
+                    )
+                elif name == "initiative_feedback":
+                    name = "schedule_change"
+                    result = (
+                        {
+                            "id": result.get("schedule_id"),
+                            "action": "cancel"
+                            if result.get("action") in {"stop", "pause"}
+                            else "reschedule",
+                        }
+                        if result.get("schedule_id") and not result.get("error")
+                        else {"error": "Initiative feedback failed"}
+                    )
                 receipts.append({"name": name, "result": result})
     return receipts
 
@@ -187,19 +227,55 @@ class Agent:
         *,
         proactive=False,
         scheduled=False,
+        initiative=None,
     ):
         user_id = run["user_id"]
         prefs = await self.store.preferences(user_id)
         user = await self.store.ensure_user(user_id)
-        projects = await project_context(self.store, user_id, conversation["id"])
+        projects: dict[str, Any]
+        if initiative is not None:
+            if not proactive or not scheduled:
+                raise CancelledRun("Prepared initiative requires its proactive timer")
+            live_policy = await self.store.get_initiative_for_schedule(
+                user_id, initiative["schedule_id"]
+            )
+            if (
+                not live_policy
+                or not live_policy.get("available")
+                or live_policy["revision"] != initiative["revision"]
+                or live_policy["project_revision"] != initiative["project_revision"]
+            ):
+                raise CancelledRun("Prepared initiative policy changed")
+            current = await self.store.get_project(user_id, project_id=initiative["project_id"])
+            projects = {"current": current, "available": []}
+        else:
+            projects = await project_context(self.store, user_id, conversation["id"])
         workflow = await workflow_context(self.store, user_id, projects["current"])
-        recipes = await recipe_context(self.store, user_id, conversation["id"])
+        recipes = (
+            {}
+            if initiative is not None
+            else await recipe_context(self.store, user_id, conversation["id"])
+        )
         memories = await self.store.query_memories(
             user_id,
             conversation_id=conversation["id"],
             project_id=(projects["current"] or {}).get("id"),
         )
         history = await self.store.history(user_id, conversation["id"])
+        if initiative is not None:
+            history = [
+                {
+                    **message,
+                    "content": [
+                        part
+                        for part in message["content"]
+                        if isinstance(part, dict) and part.get("type") == "text"
+                    ],
+                }
+                if isinstance(message.get("content"), list)
+                else message
+                for message in history
+            ]
         query = recall_query(prompt)
         recalled = (
             await self.store.conversation_recall(user_id, conversation["id"], query, limit=3)
@@ -207,8 +283,12 @@ class Agent:
             else []
         )
         image_cache = {}
-        files = await self.store.list_artifacts(user_id)
-        schedules = await self.store.list_schedules(user_id)
+        files = (
+            [{"id": value} for value in (projects["current"] or {}).get("artifact_ids", [])]
+            if initiative is not None
+            else await self.store.list_artifacts(user_id)
+        )
+        schedules = [] if initiative is not None else await self.store.list_schedules(user_id)
         now = datetime.now(ZoneInfo(prefs.get("timezone", "UTC")))
         system = f"""Ты Cronos — личный AI-агент в Telegram. Помогаешь человеку в повседневной жизни,
 работе, обучении и творчестве. Говори естественно по-русски, подстраиваясь под его стиль.
@@ -260,6 +340,9 @@ dynamic=false годится только для отправки заранее
 колонки, формат файла и критерий актуальности, если они известны. Не пиши «как выше» или «как вчера».
 Для разовой задачи interval_seconds=null; для повторения укажи согласованный интервал.
 Подтверждай создание или изменение расписания только после успешного инструмента с реальным id.
+Подготовленную полезную инициативу по проекту настраивай через initiative_configure только после
+согласия proactivity=true и согласования темы/инструментов. Для неё не используй обычный schedule_create.
+Управление частотой и паузой — initiative_feedback. Согласие само по себе не создаёт политику.
 Если инструмент вернул ошибку, расписание не создано: исправь причину или честно объясни её.
 Если timezone_confirmed отсутствует и человек не указал абсолютное время/часовой пояс, уточни пояс
 перед планированием. Не угадывай местоположение по языку. Изменение timezone подтверждает пояс.
@@ -284,7 +367,8 @@ dynamic=false годится только для отправки заранее
 Если пользователь просит забыть факт — memory_forget, затем короткое подтверждение без повторения факта.
 Формат ответа — обычный текст с аккуратным Markdown; ссылки сохраняй. Технические детали скрывай,
 кроме явного запроса. При недоступном навыке сообщай честно и предложи доступный следующий шаг.
-{"Это инициативное обращение по уже согласованной теме. Только короткий уместный текст; не создавай новые действия и не вызывай платные вспомогательные навыки." if proactive else ""}
+{"Это инициативное обращение по уже согласованной теме. Только короткий уместный текст; не создавай новые действия и не вызывай платные вспомогательные навыки." if proactive and initiative is None else ""}
+{"Это подготовленная полезная инициатива по согласованной политике: " + json.dumps(initiative, default=str, ensure_ascii=False) + ". Сначала подготовь конкретный полезный результат, используя только разрешённые инструменты и этот проект. file_create пока лишь сохраняет файл. После ВСЕХ чтений, поисков и файлов вызови initiative_decide с причиной пользы и устойчивым evidence_key существенных фактов либо initiative_skip, если полезного изменения нет. Не отправляй просто напоминание о существовании цели. Не выдумывай сведения при ошибках поиска. Нет решения — нет отправки. Не изменяй проекты, память, настройки, планы, расписания и тариф. Итоговый текст кратко объясняет готовую пользу, содержит источники при наличии и не обещает ещё не выполненных действий." if initiative is not None else ""}
 {"Сейчас исполняется ранее заказанное пользователем задание по расписанию. Выполни его сейчас: получи свежие сведения через web_search и создай/отправь требуемые файлы через file_create. Не создавай новое расписание и не изменяй настройки, память, темы или тарифы. Ссылки и дату актуальности сохраняй в отчёте. При сбое честно укажи, что не выполнено; не подменяй свежие данные догадками." if scheduled and not proactive else ""}
 """
         config: RunnableConfig = {
@@ -324,7 +408,9 @@ dynamic=false годится только для отправки заранее
                     reasoning = bool(prefs.get("reasoning"))
                     if reasoning and not prefs.get("model"):
                         model = self.settings.model_reasoning
-                    tools = available_tools(scheduled=scheduled, proactive=proactive)
+                    tools = available_tools(
+                        scheduled=scheduled, proactive=proactive, initiative=initiative
+                    )
                     if tools is not None:
                         tools = [
                             item
@@ -423,7 +509,14 @@ dynamic=false годится только для отправки заранее
                     else:
                         return {
                             "messages": state["messages"]
-                            + [clean, {"role": "system", "content": SCHEDULE_REPAIR_PROMPT}],
+                            + [
+                                clean,
+                                {
+                                    "role": "system",
+                                    "content": SCHEDULE_REPAIR_PROMPT
+                                    + " Для подготовленной инициативы по согласованному проекту используй initiative_configure; не подменяй её обычным расписанием.",
+                                },
+                            ],
                             "step": step + 1,
                             "answer": "",
                             "schedule_repairs": 1,
@@ -459,6 +552,7 @@ dynamic=false годится только для отправки заранее
                                 scheduled=scheduled,
                                 proactive=proactive,
                                 image_context=latest_image_references(messages[:-1]),
+                                **({"initiative": initiative} if initiative is not None else {}),
                             )
                         except CancelledRun:
                             raise
@@ -471,7 +565,11 @@ dynamic=false годится только для отправки заранее
                             TelegramAPIError,
                             OSError,
                         ) as error:
-                            if scheduled and not proactive and isinstance(error, ProviderError):
+                            if (
+                                scheduled
+                                and (not proactive or initiative is not None)
+                                and isinstance(error, ProviderError)
+                            ):
                                 # Retry the scheduled occurrence; never checkpoint a transient
                                 # research failure as a successful report with a cached tool error.
                                 raise
@@ -525,7 +623,11 @@ dynamic=false годится только для отправки заранее
                 "answer": "",
             }
             if snapshot.values and not snapshot.next and snapshot.values.get("answer"):
-                return self.final_answer(snapshot.values)
+                return (
+                    initiative_result(snapshot.values)
+                    if initiative is not None
+                    else self.final_answer(snapshot.values)
+                )
             try:
                 result = await compiled.ainvoke(
                     None if snapshot.next else initial, config, durability="sync"
@@ -542,7 +644,9 @@ dynamic=false годится только для отправки заранее
                     else "Готово — изображение подготовлено.",
                 }
             await self.active(run)
-            return self.final_answer(result)
+            return (
+                initiative_result(result) if initiative is not None else self.final_answer(result)
+            )
 
     @staticmethod
     def final_answer(state):
@@ -658,10 +762,19 @@ dynamic=false годится только для отправки заранее
         scheduled=False,
         proactive=False,
         image_context=None,
+        initiative=None,
     ):
-        if proactive or (scheduled and name not in SCHEDULED_TOOL_NAMES):
+        if initiative is not None:
+            if not proactive or not scheduled:
+                raise ValueError("Prepared initiative requires a proactive scheduled run")
+            args = await scope_initiative_tool(self.store, name, args, run, initiative)
+        elif proactive or (scheduled and name not in SCHEDULED_TOOL_NAMES):
             raise ValueError("Этот инструмент недоступен при выполнении данного задания.")
         user = run["user_id"]
+        if name in INITIATIVE_TOOL_NAMES:
+            return await execute_initiative_tool(
+                self.store, name, args, op, run, conversation, policy=initiative
+            )
         if name in RECIPE_TOOL_NAMES:
             return await execute_recipe_tool(self.store, name, args, op, run, conversation)
         if name in PROJECT_TOOL_NAMES:
@@ -714,7 +827,9 @@ dynamic=false годится только для отправки заранее
                 "model": result["usage"].get("model"),
             }
         if name == "web_search":
-            return await self.paid(run, op + ":usage", lambda: self.provider.search(args["query"]))
+            return await self.paid(
+                run, op + ":usage", lambda: self.provider.search(args["query"]), proactive=proactive
+            )
         if name == "schedule_create":
             return await self.store.schedule(
                 user,
@@ -792,17 +907,18 @@ dynamic=false годится только для отправки заранее
                     project_id=project_id,
                     proactive=proactive,
                 )
-            await self.store.enqueue_for_run(
-                run,
-                conversation,
-                {"document_path": artifact["path"], "caption": artifact["filename"]},
-                op,
-            )
+            if initiative is None:
+                await self.store.enqueue_for_run(
+                    run,
+                    conversation,
+                    {"document_path": artifact["path"], "caption": artifact["filename"]},
+                    op,
+                )
             return {
                 **version,
                 "artifact_id": artifact["id"],
                 "filename": artifact["filename"],
-                "delivery": "queued",
+                "delivery": "prepared" if initiative is not None else "queued",
             }
         if name == "image_analyze":
             artifact = await self.store.get_artifact(user, args["artifact_id"])

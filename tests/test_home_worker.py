@@ -90,6 +90,7 @@ def case(monkeypatch):
         monkeypatch.setattr(worker, name, value, raising=False)
     ensure_mock = AsyncMock(side_effect=ensure)
     monkeypatch.setattr("cronos.worker.ensure_home", ensure_mock)
+    monkeypatch.setattr("cronos.worker.personal_main_panel", AsyncMock(return_value=main_panel()))
     erasure = AsyncMock()
     monkeypatch.setattr("cronos.worker.perform_erasure", erasure)
     return SimpleNamespace(

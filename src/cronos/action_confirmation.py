@@ -25,7 +25,7 @@ UNCONFIRMED_SCHEDULE_TEXT = (
 )
 
 _SCHEDULE = re.compile(
-    r"\b(?:напоминан\w*|уведомлен\w*|таймер\w*|reminders?|notifications?|alerts?)\b"
+    r"\b(?:напоминан\w*|уведомлен\w*|таймер\w*|инициатив\w*|reminders?|notifications?|alerts?|initiatives?)\b"
 )
 _TIMETABLE = re.compile(r"\b(?:расписан\w*|schedules?)\b")
 _TEMPORAL = re.compile(

@@ -43,6 +43,7 @@ def test_main_navigation_routes_match_public_contract():
     assert panel["text"].startswith("🪐 Cronos")
     assert callbacks(panel) == [
         "chat:new",
+        "home:projects:0",
         "home:chats:0",
         "home:tasks:0",
         "home:plans",
@@ -204,7 +205,7 @@ def test_memory_paginates_eight_records_and_keeps_shared_memory_explanation():
     assert "8. Факт 8" in first["text"] and "9. Факт 9" not in first["text"]
     assert "9. Факт 9" in second["text"]
     assert "secret-id" not in first["text"]
-    assert "общая для всех чатов" in first["text"]
+    assert "для проекта или отдельного чата" in first["text"]
     assert "home:memory:1" in callbacks(first) and "home:memory:0" in callbacks(second)
     assert_valid(first)
     assert_valid(second)

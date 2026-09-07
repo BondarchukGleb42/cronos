@@ -1,6 +1,7 @@
 """Owner-scoped project persistence, mixed into Store without importing it."""
 
 from contextlib import AbstractAsyncContextManager
+from functools import wraps
 from uuid import UUID, uuid4
 
 import asyncpg
@@ -9,6 +10,17 @@ PROJECT_STATUSES = {"active", "paused", "completed"}
 STATE_LISTS = {"constraints", "decisions", "open_questions"}
 STATE_FIELDS = STATE_LISTS | {"next_step", "summary"}
 PROJECT_FIELDS = {"name", "goal", "status", "state"}
+
+
+def serialize_project_delivery(function):
+    """A project change cannot acknowledge while an older initiative is sending."""
+
+    @wraps(function)
+    async def wrapped(self, user_id, *args, **kwargs):
+        async with self.user_lock(user_id, "delivery"):
+            return await function(self, user_id, *args, **kwargs)
+
+    return wrapped
 
 
 class ProjectRevisionConflict(ValueError):
@@ -296,6 +308,7 @@ class ProjectsStoreMixin:
             )
             return await _detail(conn, user_id, found) if found else None
 
+    @serialize_project_delivery
     async def update_project(self, user_id: int, project_id, args: dict, source_key: str) -> dict:
         patch = _patch(args)
         source_key = _source_key(source_key)
@@ -348,6 +361,7 @@ class ProjectsStoreMixin:
             )
             return await _detail(conn, user_id, project_id)
 
+    @serialize_project_delivery
     async def attach_project(
         self,
         user_id: int,
@@ -407,6 +421,7 @@ class ProjectsStoreMixin:
             )
             return await _detail(conn, user_id, project_id)
 
+    @serialize_project_delivery
     async def detach_project(
         self,
         user_id: int,
@@ -462,6 +477,7 @@ class ProjectsStoreMixin:
                 )
             return await _detail(conn, user_id, project_id) if project_id else None
 
+    @serialize_project_delivery
     async def attach_project_artifact(
         self,
         user_id: int,

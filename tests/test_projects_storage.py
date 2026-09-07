@@ -177,6 +177,33 @@ async def test_partial_state_update_cas_and_late_replay_preserve_latest_data(sto
     }
 
 
+async def test_project_update_waits_for_inflight_delivery_before_acknowledging(store):
+    project, conversation = await create(store)
+    started = asyncio.Event()
+
+    async def change():
+        started.set()
+        return await store.update_project(
+            A,
+            project["id"],
+            {
+                "revision": project["revision"],
+                "conversation_id": conversation["id"],
+                "status": "completed",
+            },
+            "complete-after-send",
+        )
+
+    async with store.user_lock(A, "delivery"):
+        task = asyncio.create_task(change())
+        await started.wait()
+        await asyncio.sleep(0.05)
+        assert not task.done()
+        assert (await store.get_project(A, project_id=project["id"]))["status"] == "active"
+    result = await asyncio.wait_for(task, 3)
+    assert result["status"] == "completed"
+
+
 async def test_concurrent_same_revision_has_exactly_one_winner(store):
     project, conversation = await create(store)
     result = await asyncio.gather(

@@ -6,19 +6,26 @@ import resource
 import time
 from contextlib import suppress
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import aio_pika
 
 from cronos.agent import Agent, CancelledRun, setup_checkpoints
 from cronos.file_tasks import file_task
 from cronos.home import HomeUnavailable, ensure_home, unavailable_panel
+from cronos.home_dashboard import (
+    continue_home_project,
+    hide_home_project,
+    home_overview,
+    home_project_panel,
+    personal_main_panel,
+)
 from cronos.home_views import (
     chats_panel,
     guide_panel,
-    main_panel,
     memory_panel,
     plans_panel,
+    projects_panel,
     settings_panel,
     tasks_panel,
 )
@@ -33,7 +40,7 @@ from cronos.privacy import (
 from cronos.providers import Provider, ProviderError
 from cronos.settings import get_settings
 from cronos.storage import STOP_COMMANDS, Store, message_command
-from cronos.telegram import TelegramTransport, navigation_keyboard
+from cronos.telegram import TelegramTransport, navigation_keyboard, split_text
 from cronos.topics import create_chat, welcome_topic
 
 log = logging.getLogger(__name__)
@@ -322,7 +329,7 @@ class Worker:
                         user_id,
                         user_id,
                         0,
-                        {**main_panel(), "pin": True},
+                        {**await personal_main_panel(self.store, user_id), "pin": True},
                         f"home-fallback:{event['id']}",
                     )
             except HomeUnavailable as error:
@@ -340,6 +347,7 @@ class Worker:
             "/plans": "plans",
             "/upgrade": "plans",
             "/memory": "memory",
+            "/projects": "projects",
             "/settings": "settings",
         }
         data = (callback or {}).get("data") or ""
@@ -350,14 +358,23 @@ class Worker:
         if data.startswith("home:"):
             parts = data.split(":")
             page = parts[1]
-            if page in {"chats", "tasks", "memory"}:
+            if page in {"chats", "tasks", "memory", "projects"}:
                 if len(parts) != 3 or not parts[2].isdigit() or len(parts[2]) > 6:
                     page = None
                 else:
                     number = int(parts[2])
+            elif page in {"project", "hide", "continue", "result"} and len(parts) == 3:
+                try:
+                    value = str(UUID(parts[2]))
+                except ValueError:
+                    page = None
+                else:
+                    action = page
+                    if page in {"hide", "result"}:
+                        page = "main"
             elif page == "proactivity" and len(parts) == 3 and parts[2] in {"on", "off"}:
                 action, value, page = "proactivity", parts[2] == "on", "settings"
-            elif page in {"retry", "clearall"} and len(parts) == 2:
+            elif page in {"retry", "clearall", "show"} and len(parts) == 2:
                 action, page = page, "main"
             elif page not in {"main", "guide", "plans", "settings"} or len(parts) != 2:
                 page = None
@@ -406,8 +423,34 @@ class Worker:
             balance = await self.store.change_plan(user_id, value, f"callback:{callback['id']}")
         else:
             balance = None
+        if action == "hide":
+            await hide_home_project(self.store, user_id, value)
+        elif action == "show":
+            await self.store.preferences(
+                user_id, {"home_hidden_projects": {}, "home_suggestions": True}
+            )
+        elif action == "result":
+            overview = await home_overview(self.store, user_id)
+            if value in {row["id"] for row in overview["results"]}:
+                artifact = await self.store.get_artifact(user_id, value)
+                field = "photo_path" if artifact["mime"].startswith("image/") else "document_path"
+                await self.store.enqueue(
+                    user_id,
+                    chat_id,
+                    home["thread_id"],
+                    {field: artifact["path"], "caption": artifact["filename"]},
+                    f"home-result:{event['id']}",
+                )
         if page == "main":
-            panel = main_panel()
+            panel = await personal_main_panel(self.store, user_id)
+        elif page == "project":
+            panel = await home_project_panel(self.store, user_id, value)
+        elif page == "continue":
+            panel = await continue_home_project(
+                self.store, self.transport, user_id, chat_id, value, event["id"]
+            )
+        elif page == "projects":
+            panel = projects_panel(await self.store.list_projects(user_id, limit=100), number)
         elif page == "guide":
             panel = guide_panel()
         elif page == "chats":
@@ -594,7 +637,9 @@ class Worker:
             finally:
                 await self.store.finish_run(run["id"], status, fence=run["fence"])
 
-    async def answer(self, event, conversation, prompt, *, proactive=False, schedule=None):
+    async def answer(
+        self, event, conversation, prompt, *, proactive=False, schedule=None, initiative=None
+    ):
         run = await self.store.start_run(event["id"], conversation["user_id"], conversation["id"])
         started, cpu = time.monotonic(), time.process_time()
         status = "failed"
@@ -613,15 +658,56 @@ class Worker:
                     draft_heartbeat = asyncio.create_task(
                         self.refresh_preview(run, conversation, draft_id)
                     )
-            result = await self.agent.run(
-                run, conversation, prompt, proactive=proactive, scheduled=schedule is not None
-            )
+            agent_options = {"proactive": proactive, "scheduled": schedule is not None}
+            if initiative is not None:
+                if not initiative.get("available") or not proactive or schedule is None:
+                    raise CancelledRun("Prepared initiative policy is unavailable")
+                agent_options["initiative"] = initiative
+            result = await self.agent.run(run, conversation, prompt, **agent_options)
             if draft_heartbeat:
                 await cancel_tasks([draft_heartbeat])
                 draft_heartbeat = None
             answer = result["text"] if isinstance(result, dict) else result
             image_ids = result.get("image_artifact_ids", []) if isinstance(result, dict) else []
             payload = {"text": answer, "format": "rich"}
+            if initiative is not None:
+                decision = result.get("initiative_decision") if isinstance(result, dict) else None
+                if not isinstance(decision, dict) or not isinstance(
+                    decision.get("should_send"), bool
+                ):
+                    raise CancelledRun("Prepared initiative has no durable send decision")
+                if not decision["should_send"]:
+                    status = "done"
+                    return status
+                guard = decision.get("delivery_guard")
+                if (
+                    not isinstance(guard, dict)
+                    or guard.get("initiative_id") != initiative["id"]
+                    or not await self.store.validate_initiative_delivery(
+                        conversation["user_id"], guard
+                    )
+                ):
+                    raise CancelledRun("Prepared initiative decision is no longer valid")
+                if not isinstance(answer, str) or not answer.strip() or image_ids:
+                    raise CancelledRun("Prepared initiative result is invalid")
+                prepared_ids = result.get("prepared_artifact_ids", [])
+                if not isinstance(prepared_ids, list) or any(
+                    not isinstance(value, str) for value in prepared_ids
+                ):
+                    raise CancelledRun("Prepared initiative file references are invalid")
+                # One outbox and final acknowledgement cover every prepared file. A partial
+                # Telegram send retries only the persisted tail of these same parts.
+                parts = [{"kind": "rich", "text": part} for part in split_text(answer, 12000)]
+                for artifact_id in dict.fromkeys(prepared_ids):
+                    artifact = await self.store.get_artifact(conversation["user_id"], artifact_id)
+                    parts.append(
+                        {
+                            "kind": "document",
+                            "path": artifact["path"],
+                            "caption": artifact["filename"],
+                        }
+                    )
+                payload = {"_telegram_parts": parts, **guard}
             if image_ids:
                 images = [
                     await self.store.get_artifact(conversation["user_id"], artifact_id)
@@ -692,6 +778,9 @@ class Worker:
             status = "cancelled"
         except ProviderError:
             status = "failed"
+            if initiative is not None:
+                # Retry optional preparation without a generic fallback or unfinished file.
+                raise
             if schedule and not proactive:
                 # Keep the durable timer pending for its bounded event retry. A report
                 # fallback must not masquerade as successful task execution.
@@ -765,11 +854,20 @@ class Worker:
             if schedule["proactive"] and not prefs.get("proactivity"):
                 await self.store.mark_occurrence(data["occurrence_id"], "cancelled")
                 return
+            initiative = None
+            if schedule.get("initiative_id"):
+                initiative = await self.store.get_initiative_for_schedule(
+                    schedule["user_id"], schedule["id"]
+                )
+                if not initiative or not initiative.get("available"):
+                    await self.store.mark_occurrence(data["occurrence_id"], "cancelled")
+                    return
             conversation = await self.store.conversation(
                 schedule["user_id"], schedule["chat_id"], schedule["thread_id"]
             )
             if schedule["dynamic"]:
                 try:
+                    options = {"initiative": initiative} if initiative is not None else {}
                     status = await self.answer(
                         event,
                         conversation,
@@ -778,6 +876,7 @@ class Worker:
                         "Задание: " + schedule["instruction"],
                         proactive=schedule["proactive"],
                         schedule=schedule,
+                        **options,
                     )
                 except ProviderError:
                     if event.get("attempts", 1) >= 3:

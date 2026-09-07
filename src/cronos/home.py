@@ -2,7 +2,7 @@
 
 from aiogram.exceptions import TelegramBadRequest
 
-from cronos.home_views import main_panel
+from cronos.home_dashboard import personal_main_panel
 from cronos.topics import create_chat
 
 HOME_TITLE = "🪐 Cronos"
@@ -56,7 +56,7 @@ async def welcome_home(store, home):
         home["user_id"],
         home["chat_id"],
         home["thread_id"],
-        {**main_panel(), "pin": True},
+        {**await personal_main_panel(store, home["user_id"]), "pin": True},
         f"home-welcome:{home['id']}",
     )
 
