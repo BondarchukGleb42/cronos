@@ -80,10 +80,14 @@ async def execute_project_tool(store, name, args, op, run, conversation):
 
 async def project_context(store, user_id, conversation_id):
     current = await store.get_project(user_id, conversation_id=conversation_id)
+    if current and current.get("needs_context"):
+        current = None
     projects = await store.list_projects(user_id, limit=20)
     return {
         "current": current,
         "available": [
-            {key: row[key] for key in ("id", "name", "status", "revision")} for row in projects
+            {key: row[key] for key in ("id", "name", "status", "revision")}
+            for row in projects
+            if not row.get("needs_context")
         ],
     }

@@ -11,6 +11,8 @@ from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 import asyncpg
 from dateutil.relativedelta import relativedelta
 
+from cronos.memory import MemoryStoreMixin
+from cronos.memory_privacy import invalidate_memory_context
 from cronos.projects import ProjectsStoreMixin
 from cronos.settings import Settings
 
@@ -79,7 +81,7 @@ def privacy_event_id(request_id) -> UUID:
     return uuid5(NAMESPACE_URL, f"cronos:privacy:{uid(request_id)}")
 
 
-class Store(ProjectsStoreMixin):
+class Store(ProjectsStoreMixin, MemoryStoreMixin):
     def __init__(self, settings: Settings):
         self.settings = settings
         self.pool: asyncpg.Pool | None = None
@@ -1518,35 +1520,50 @@ class Store(ProjectsStoreMixin):
             )
 
     async def memories(self, user_id: int):
-        async with self.connection(user_id) as conn:
-            return [
-                dict(x)
-                for x in await conn.fetch(
-                    "SELECT id,content,category FROM memory WHERE user_id=$1 ORDER BY created_at DESC LIMIT 100",
-                    user_id,
-                )
-            ]
+        return await self.query_memories(user_id, all_scopes=True)
 
     async def remember(self, user_id: int, content: str, category="preference", source=""):
-        async with self.connection(user_id) as conn:
-            row = await conn.fetchrow(
-                "INSERT INTO memory(id,user_id,content,category,source) VALUES($1,$2,$3,$4,$5) ON CONFLICT(user_id,content) DO UPDATE SET category=EXCLUDED.category RETURNING id,content",
-                uuid4(),
-                user_id,
-                content,
-                category,
-                source,
-            )
-            return {"id": str(row["id"]), "content": row["content"]}
+        return await self.write_memory(
+            user_id, content, category, source, source_key=f"legacy-memory:{uuid4()}"
+        )
 
-    async def forget(self, user_id: int, query: str, current_run=None):
-        async with self.connection(user_id) as conn:
+    async def forget(
+        self, user_id: int, query: str, current_run=None, *, source_key=None, run_fence=None
+    ):
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError("Укажи факт, который нужно забыть")
+        if isinstance(current_run, dict):
+            run_fence = current_run.get("fence", run_fence)
+            current_run = current_run["id"]
+        async with self.user_lock(user_id, purpose="delivery"), self.connection(user_id) as conn:
+            await conn.fetchval("SELECT user_id FROM users WHERE user_id=$1 FOR UPDATE", user_id)
+            if source_key:
+                replay = await conn.fetchrow(
+                    "SELECT result FROM operations WHERE user_id=$1 AND id=$2 AND kind='memory_forget' AND status='done'",
+                    user_id,
+                    source_key,
+                )
+                if replay:
+                    return replay["result"]
+            if current_run is not None and run_fence is not None:
+                active = await conn.fetchval(
+                    "SELECT id FROM runs WHERE user_id=$1 AND id=$2 AND fence=$3 AND status='running' AND NOT cancel_requested FOR SHARE",
+                    user_id,
+                    uid(current_run),
+                    run_fence,
+                )
+                if not active:
+                    raise ValueError("Запрос отменён или уже заменён новым запуском")
+            matches = []
+            needle = query.casefold()
+            async for fact in conn.cursor("SELECT id,content FROM memory WHERE user_id=$1", user_id):
+                if needle in fact["content"].casefold() or str(fact["id"]) == query:
+                    matches.append(fact["id"])
             deleted = await conn.fetch(
-                "DELETE FROM memory WHERE user_id=$1 AND (content ILIKE $2 OR id::text=$3) RETURNING content",
-                user_id,
-                "%" + query + "%",
-                query,
+                "DELETE FROM memory WHERE user_id=$1 AND id=ANY($2::uuid[]) RETURNING content",
+                user_id, matches,
             )
+            await invalidate_memory_context(conn, user_id)
             # Rotating all active context prevents facts returning through a checkpoint or paraphrase.
             await conn.execute("UPDATE messages SET excluded=true WHERE user_id=$1", user_id)
             conversations = await conn.fetch(
@@ -1584,7 +1601,17 @@ class Store(ProjectsStoreMixin):
                 if current_run
                 else None,
             )
-            return {"forgotten": [x["content"] for x in deleted], "context_reset": True}
+            result = {"forgotten": [x["content"] for x in deleted], "context_reset": True}
+            if source_key:
+                result = {"forgotten_count": len(deleted), "context_reset": True}
+                await conn.execute(
+                    "INSERT INTO operations(id,user_id,run_id,kind,result,status) VALUES($1,$2,$3,'memory_forget',$4,'done') ON CONFLICT(id) DO NOTHING",
+                    source_key,
+                    user_id,
+                    uid(current_run) if current_run else None,
+                    result,
+                )
+            return result
 
     async def claim_event(self, owner: str, event_id=None):
         async with self.connection() as conn:
@@ -2330,6 +2357,8 @@ async def migrate(settings: Settings):
             await conn.execute("SELECT pg_advisory_xact_lock(903125)")
             await conn.execute(Path(__file__).with_name("schema.sql").read_text())
             await conn.execute(Path(__file__).with_name("projects.sql").read_text())
+            await conn.execute(Path(__file__).with_name("memory_privacy.sql").read_text())
+            await conn.execute(Path(__file__).with_name("memory.sql").read_text())
     finally:
         await conn.close()
 

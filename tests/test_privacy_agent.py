@@ -80,6 +80,7 @@ async def test_graph_ends_at_privacy_receipt_without_another_model_or_later_tool
         "preferences": {},
         "ensure_user": {"plan": "FREE"},
         "memories": [],
+        "query_memories": [],
         "history": [],
         "list_artifacts": [],
         "list_schedules": [],

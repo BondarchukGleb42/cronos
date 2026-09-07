@@ -86,6 +86,7 @@ def case(tmp_path):
         preferences=AsyncMock(return_value={}),
         ensure_user=AsyncMock(return_value={"plan": "FREE"}),
         memories=AsyncMock(return_value=[]),
+        query_memories=AsyncMock(return_value=[]),
         history=AsyncMock(return_value=[]),
         list_artifacts=AsyncMock(return_value=[]),
         list_schedules=AsyncMock(return_value=[]),

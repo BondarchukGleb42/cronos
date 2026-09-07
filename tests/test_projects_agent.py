@@ -247,6 +247,7 @@ async def test_project_graph_create_replay_and_next_run_use_durable_current_stat
         "preferences": {},
         "ensure_user": {"plan": "FREE"},
         "memories": [],
+        "query_memories": [],
         "history": [],
         "list_artifacts": [],
         "list_schedules": [],

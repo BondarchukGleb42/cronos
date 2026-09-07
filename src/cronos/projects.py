@@ -143,6 +143,13 @@ async def _change(conn, user_id, project_id, revision, kind, source_key, origin,
 
 
 def _public(row) -> dict:
+    if row.get("context_excluded", False):
+        return {
+            "id": str(row["id"]),
+            "revision": row["revision"],
+            "status": row["status"],
+            "needs_context": True,
+        }
     return {
         **dict(row),
         "id": str(row["id"]),
@@ -153,6 +160,8 @@ def _public(row) -> dict:
 
 async def _detail(conn, user_id, project_id) -> dict:
     result = _public(await _project_row(conn, user_id, project_id))
+    if result.get("needs_context"):
+        return result
     project_id = _uid(project_id)
     result["conversation_ids"] = [
         str(row["conversation_id"])
@@ -175,10 +184,11 @@ async def _detail(conn, user_id, project_id) -> dict:
     # History is durable; only the latest 20 changes are included in model context.
     changes = await conn.fetch(
         """SELECT revision,kind,conversation_id,run_id,patch,created_at
-        FROM project_changes WHERE user_id=$1 AND project_id=$2
+        FROM project_changes WHERE user_id=$1 AND project_id=$2 AND revision>$3
         ORDER BY revision DESC,created_at DESC LIMIT 21""",
         user_id,
         project_id,
+        result.get("context_reset_revision", 0),
     )
     result["history_has_more"] = len(changes) > 20
     result["history"] = [
@@ -309,16 +319,26 @@ class ProjectsStoreMixin:
                 return await _detail(conn, user_id, project_id)
             if current["revision"] != revision:
                 raise ProjectRevisionConflict("Project changed; reload its current revision")
+            excluded = current.get("context_excluded", False)
+            if excluded and not {"name", "goal"} <= patch.keys():
+                raise ValueError(
+                    "Project context was cleared; provide a new explicit name and goal"
+                )
+            base_state = (
+                {**{key: [] for key in STATE_LISTS}, "next_step": "", "summary": ""}
+                if excluded
+                else current["state"]
+            )
             updated = await conn.fetchval(
                 """UPDATE projects SET name=$3,goal=$4,status=$5,state=$6,
-                revision=revision+1,updated_at=clock_timestamp()
+                revision=revision+1,updated_at=clock_timestamp(),context_excluded=false
                 WHERE user_id=$1 AND id=$2 AND revision=$7 RETURNING revision""",
                 user_id,
                 project_id,
                 patch.get("name", current["name"]),
                 patch.get("goal", current["goal"]),
-                patch.get("status", current["status"]),
-                {**current["state"], **patch.get("state", {})},
+                patch.get("status", "active" if excluded else current["status"]),
+                {**base_state, **patch.get("state", {})},
                 revision,
             )
             if updated is None:

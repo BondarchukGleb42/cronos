@@ -26,6 +26,7 @@ from cronos.artifacts import ArtifactManager
 from cronos.capabilities import SKILLS, TOOLS, catalog_context
 from cronos.file_tasks import file_task
 from cronos.file_text import text_window
+from cronos.memory_tools import MEMORY_TOOL_NAMES, execute_memory_tool
 from cronos.multimodal import (
     clarification_before_image,
     generated_image_ids,
@@ -165,12 +166,16 @@ class Agent:
         user_id = run["user_id"]
         prefs = await self.store.preferences(user_id)
         user = await self.store.ensure_user(user_id)
-        memories = await self.store.memories(user_id)
+        projects = await project_context(self.store, user_id, conversation["id"])
+        memories = await self.store.query_memories(
+            user_id,
+            conversation_id=conversation["id"],
+            project_id=(projects["current"] or {}).get("id"),
+        )
         history = await self.store.history(user_id, conversation["id"])
         image_cache = {}
         files = await self.store.list_artifacts(user_id)
         schedules = await self.store.list_schedules(user_id)
-        projects = await project_context(self.store, user_id, conversation["id"])
         now = datetime.now(ZoneInfo(prefs.get("timezone", "UTC")))
         system = f"""Ты Cronos — личный AI-агент в Telegram. Помогаешь человеку в повседневной жизни,
 работе, обучении и творчестве. Говори естественно по-русски, подстраиваясь под его стиль.
@@ -566,6 +571,8 @@ dynamic=false годится только для отправки заранее
         user = run["user_id"]
         if name in PROJECT_TOOL_NAMES:
             return await execute_project_tool(self.store, name, args, op, run, conversation)
+        if name in MEMORY_TOOL_NAMES:
+            return await execute_memory_tool(self.store, name, args, op, run, conversation)
         if name == "privacy_request":
             request = await self.store.requests_prepare(
                 user,
@@ -582,14 +589,10 @@ dynamic=false годится только для отправки заранее
             }
         if name == "skill_info":
             return SKILLS[args["skill"]]
-        if name == "memory_list":
-            return await self.store.memories(user)
-        if name == "memory_write":
-            return await self.store.remember(
-                user, args["content"], args.get("category", "preference"), str(run["event_id"])
-            )
         if name == "memory_forget":
-            return await self.store.forget(user, args["query"], current_run=run["id"])
+            return await self.store.forget(
+                user, args["query"], current_run=run["id"], source_key=op, run_fence=run["fence"]
+            )
         if name == "preferences_set":
             if "timezone" in args:
                 ZoneInfo(args["timezone"])
