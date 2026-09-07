@@ -93,6 +93,8 @@ def case(tmp_path):
         conversation_recall=AsyncMock(return_value=[]),
         list_artifacts=AsyncMock(return_value=[]),
         list_schedules=AsyncMock(return_value=[]),
+        recipe_list=AsyncMock(return_value=[]),
+        list_pending_recipe=AsyncMock(return_value=[]),
         get_project=AsyncMock(return_value=None),
         list_projects=AsyncMock(return_value=[]),
         operation=AsyncMock(return_value=None),

@@ -15,6 +15,7 @@ from cronos.library import LibraryStoreMixin
 from cronos.memory import MemoryStoreMixin
 from cronos.memory_privacy import invalidate_memory_context
 from cronos.projects import ProjectsStoreMixin
+from cronos.recipes import RecipesStoreMixin
 from cronos.settings import Settings
 from cronos.versions import VersionsStoreMixin
 from cronos.workflows import WorkflowsStoreMixin
@@ -85,7 +86,12 @@ def privacy_event_id(request_id) -> UUID:
 
 
 class Store(
-    ProjectsStoreMixin, MemoryStoreMixin, LibraryStoreMixin, VersionsStoreMixin, WorkflowsStoreMixin
+    ProjectsStoreMixin,
+    MemoryStoreMixin,
+    LibraryStoreMixin,
+    VersionsStoreMixin,
+    WorkflowsStoreMixin,
+    RecipesStoreMixin,
 ):
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -958,6 +964,7 @@ class Store(
             )
             if full:
                 await conn.execute("DELETE FROM projects WHERE user_id=$1", owner)
+                await conn.execute("DELETE FROM recipes WHERE user_id=$1", owner)
                 await conn.execute("DELETE FROM memory WHERE user_id=$1", owner)
                 await conn.execute("DELETE FROM artifacts WHERE user_id=$1", owner)
                 await conn.execute("DELETE FROM deleted_topics WHERE user_id=$1", owner)
@@ -2370,6 +2377,7 @@ async def migrate(settings: Settings):
             await conn.execute(Path(__file__).with_name("library.sql").read_text())
             await conn.execute(Path(__file__).with_name("versions.sql").read_text())
             await conn.execute(Path(__file__).with_name("workflows.sql").read_text())
+            await conn.execute(Path(__file__).with_name("recipes.sql").read_text())
     finally:
         await conn.close()
 

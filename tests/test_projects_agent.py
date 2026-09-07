@@ -253,6 +253,8 @@ async def test_project_graph_create_replay_and_next_run_use_durable_current_stat
         "conversation_recall": [],
         "list_artifacts": [],
         "list_schedules": [],
+        "recipe_list": [],
+        "list_pending_recipe": [],
         "run_active": True,
     }.items():
         setattr(case.store, name, AsyncMock(return_value=value))

@@ -85,6 +85,8 @@ async def test_graph_ends_at_privacy_receipt_without_another_model_or_later_tool
         "conversation_recall": [],
         "list_artifacts": [],
         "list_schedules": [],
+        "recipe_list": [],
+        "list_pending_recipe": [],
         "get_project": None,
         "list_projects": [],
         "operation": None,
