@@ -36,6 +36,7 @@ def case(tmp_path):
         create_project=AsyncMock(return_value=project),
         list_projects=AsyncMock(return_value=[project]),
         get_project=AsyncMock(return_value=project),
+        workflow_get=AsyncMock(return_value=None),
         update_project=AsyncMock(return_value={**project, "revision": 2}),
         attach_project=AsyncMock(return_value=project),
         detach_project=AsyncMock(return_value={"detached": True}),

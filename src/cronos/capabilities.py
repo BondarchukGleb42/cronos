@@ -1,6 +1,10 @@
 """The executable skill registry is also the agent's source of self-knowledge."""
 
 SKILLS = {
+    "workflows": {
+        "summary": "Личные планы питания, тренировок, обучения и контента, дневник самочувствия: план → наблюдения → обновление с сохранённым прогрессом.",
+        "instructions": "По просьбе вести личный план сначала выбери или создай проект, затем workflow_templates(kind) для точных схем и примера. Без kind инструмент перечисляет шаблоны. workflow_start требует parameters, plan и project_revision из project_get. Питание учитывает явно известные продукты, единицы, число людей и время; stock меняется через observation action restock/consume/set/meal, без автоматической конвертации единиц и выдуманных калорий. Для тренировок записывай сообщённые выполнения и feedback, для обучения — конкретное evidence и ошибку, для контента — сообщённые критерии и показатели. Самочувствие — добровольные самооценки, никаких диагнозов. После сообщения пользователя workflow_get даёт актуальную revision, затем workflow_observe сохраняет наблюдение. workflow_replan меняет полный plan с revision и project_revision и синхронизирует project_summary/project_next_step; остальные поля цели проекта сохраняются. При конфликте перечитай состояние. История доступна страницами limit/offset. После забывания восстанови проект с новыми именем и целью, затем явно начни чистый workflow; старый цикл автоматически не возвращается. Не записывай догадки или предложенные действия как выполненные. Не создавай планы, расписания и инициативные сообщения без соответствующего запроса или согласия.",
+    },
     "versions": {
         "summary": "Версии документов и изображений: изменить существующий результат, сравнить историю, вернуть прежний вариант.",
         "instructions": "Для изменения готового файла сначала прочти его, затем file_create с полным новым содержимым и parent_artifact_id исходной версии. Исходник сохраняется. Для редактирования изображения передавай artifact_ids всех референсов, а parent_artifact_id — именно изменяемого изображения (не случайного первого референса альбома). change_summary кратко описывает изменение. artifact_versions показывает историю и текущий вариант; artifact_restore возвращает выбранную версию и отправляет её пользователю. Ветвиться можно от любой прежней версии. Не обещай редактировать прошлое сообщение Telegram: новая версия приходит новым сообщением. После забывания старые пояснения изменений не используются; исходные файлы удаляются отдельно или полной очисткой.",
@@ -80,6 +84,70 @@ def string(description="", enum=None):
 
 
 TOOLS = [
+    tool(
+        "workflow_templates",
+        "Выбрать шаблон личного плана; kind раскрывает точные схемы и пример.",
+        {"kind": string(enum=["nutrition", "training", "learning", "content", "wellbeing"])},
+    ),
+    tool(
+        "workflow_start",
+        "Начать согласованный личный план в проекте. До вызова прочти workflow_templates(kind).",
+        {
+            "project_id": string("Без id используется проект текущего чата"),
+            "kind": string(enum=["nutrition", "training", "learning", "content", "wellbeing"]),
+            "project_revision": {"type": "integer", "minimum": 1},
+            "parameters": {
+                "type": "object",
+                "description": "По parameters_schema выбранного шаблона",
+            },
+            "plan": {"type": "object", "description": "По plan_schema выбранного шаблона"},
+            "project_summary": string("Краткое резюме плана"),
+            "project_next_step": string("Следующий шаг из плана"),
+        },
+        ["kind", "project_revision", "parameters", "plan"],
+    ),
+    tool(
+        "workflow_get",
+        "Прочитать актуальный личный план, вычисленный прогресс и страницу наблюдений.",
+        {
+            "project_id": string(),
+            "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+            "offset": {"type": "integer", "minimum": 0},
+        },
+    ),
+    tool(
+        "workflow_observe",
+        "Записать только сообщённое пользователем наблюдение в действующем плане.",
+        {
+            "project_id": string(),
+            "revision": {"type": "integer", "minimum": 1},
+            "observation": {
+                "type": "object",
+                "description": "По observation_schema выбранного шаблона",
+            },
+            "observed_at": string(
+                "ISO timestamp с часовым поясом, только если пользователь указал иное время; иначе время записи"
+            ),
+        },
+        ["revision", "observation"],
+    ),
+    tool(
+        "workflow_replan",
+        "Сохранить согласованный обновлённый план по наблюдениям и следующий шаг проекта.",
+        {
+            "project_id": string(),
+            "revision": {"type": "integer", "minimum": 1},
+            "project_revision": {"type": "integer", "minimum": 1},
+            "plan": {"type": "object", "description": "Полный новый plan по схеме шаблона"},
+            "parameters": {
+                "type": "object",
+                "description": "Только изменённые параметры; запасы продуктов меняются наблюдением",
+            },
+            "project_summary": string("Резюме с учётом сообщённой обратной связи"),
+            "project_next_step": string("Следующий шаг из нового плана"),
+        },
+        ["revision", "project_revision", "plan", "project_summary", "project_next_step"],
+    ),
     tool(
         "artifact_versions",
         "Показать версии результата и текущий вариант по id любой его версии.",

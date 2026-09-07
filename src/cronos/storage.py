@@ -17,6 +17,7 @@ from cronos.memory_privacy import invalidate_memory_context
 from cronos.projects import ProjectsStoreMixin
 from cronos.settings import Settings
 from cronos.versions import VersionsStoreMixin
+from cronos.workflows import WorkflowsStoreMixin
 
 PLANS = {"FREE": 25_000_000, "START": 700_000_000, "PREMIUM": 1_700_000_000, "PRO": 3_700_000_000}
 HOME_TITLE = "🪐 Cronos"
@@ -83,7 +84,9 @@ def privacy_event_id(request_id) -> UUID:
     return uuid5(NAMESPACE_URL, f"cronos:privacy:{uid(request_id)}")
 
 
-class Store(ProjectsStoreMixin, MemoryStoreMixin, LibraryStoreMixin, VersionsStoreMixin):
+class Store(
+    ProjectsStoreMixin, MemoryStoreMixin, LibraryStoreMixin, VersionsStoreMixin, WorkflowsStoreMixin
+):
     def __init__(self, settings: Settings):
         self.settings = settings
         self.pool: asyncpg.Pool | None = None
@@ -2366,6 +2369,7 @@ async def migrate(settings: Settings):
             await conn.execute(Path(__file__).with_name("memory.sql").read_text())
             await conn.execute(Path(__file__).with_name("library.sql").read_text())
             await conn.execute(Path(__file__).with_name("versions.sql").read_text())
+            await conn.execute(Path(__file__).with_name("workflows.sql").read_text())
     finally:
         await conn.close()
 
