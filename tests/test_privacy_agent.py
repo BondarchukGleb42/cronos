@@ -83,6 +83,8 @@ async def test_graph_ends_at_privacy_receipt_without_another_model_or_later_tool
         "history": [],
         "list_artifacts": [],
         "list_schedules": [],
+        "get_project": None,
+        "list_projects": [],
         "operation": None,
     }.items():
         setattr(agent.store, name, AsyncMock(return_value=value))

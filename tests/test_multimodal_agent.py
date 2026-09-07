@@ -89,6 +89,8 @@ def case(tmp_path):
         history=AsyncMock(return_value=[]),
         list_artifacts=AsyncMock(return_value=[]),
         list_schedules=AsyncMock(return_value=[]),
+        get_project=AsyncMock(return_value=None),
+        list_projects=AsyncMock(return_value=[]),
         operation=AsyncMock(return_value=None),
         save_operation=AsyncMock(),
         run_active=AsyncMock(return_value=True),

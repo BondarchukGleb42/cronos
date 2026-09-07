@@ -1,6 +1,10 @@
 """The executable skill registry is also the agent's source of self-knowledge."""
 
 SKILLS = {
+    "projects": {
+        "summary": "Долгосрочные дела: цели, ограничения, решения, следующий шаг и файлы; один проект может продолжаться в нескольких чатах.",
+        "instructions": "По просьбе сохранить или вести дело используй project_create. После обычного разового вопроса не создавай проект без запроса или принятого предложения. Текущий проект и список дел видны в контексте; детали другого проекта получи project_get. После согласованного изменения плана или новой обратной связи обновляй project_update с текущей revision; при конфликте сначала перечитай проект. В state храни summary, constraints, decisions, open_questions и next_step. Обновление массива заменяет его целиком: сохрани прежние актуальные пункты. Различай факты пользователя и свои предложения. Завершение или пауза меняет status; расписания этим автоматически не отменяются. project_link связывает существующий чат, project_attach_file — файл. Связь и изменение другого проекта делай только по просьбе пользователя. Не создавай новое расписание просто из-за наличия проекта. Показывай состояние по просьбе «где остановились?». Не говори о сохранении до успешного инструмента.",
+    },
     "daily": {
         "summary": "Повседневные задачи, семья, питание, тренировки, работа, обучение и творчество.",
         "instructions": "Сначала помоги с текущей задачей. Адаптируй ответ под цели и стиль человека. Не проводи анкетирование: уточняй один действительно нужный факт за раз. Предлагай уместное продолжение: проверить прогресс, пересмотреть план, обсудить результат. Для поддержки самочувствия используй бережный разговор, не ставь диагнозы.",
@@ -68,6 +72,84 @@ def string(description="", enum=None):
 
 
 TOOLS = [
+    tool(
+        "project_create",
+        "Сохранить долгосрочное дело и связать его с текущим чатом по просьбе пользователя.",
+        {
+            "name": string(),
+            "goal": string(),
+            "state": {
+                "type": "object",
+                "properties": {
+                    "summary": string(),
+                    "next_step": string(),
+                    **{
+                        key: {"type": "array", "items": string()}
+                        for key in ("constraints", "decisions", "open_questions")
+                    },
+                },
+                "additionalProperties": False,
+            },
+        },
+        ["name", "goal"],
+    ),
+    tool(
+        "project_list",
+        "Найти сохранённые дела пользователя, включая другие чаты.",
+        {
+            "include_completed": {"type": "boolean"},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+            "offset": {"type": "integer", "minimum": 0},
+        },
+    ),
+    tool(
+        "project_get",
+        "Прочитать актуальное состояние проекта; без id — проект текущего чата.",
+        {"project_id": string()},
+    ),
+    tool(
+        "project_update",
+        "Обновить только изменившиеся поля проекта после согласования или обратной связи. Для массивов передай весь актуальный список.",
+        {
+            "project_id": string(),
+            "revision": {"type": "integer", "minimum": 1},
+            "name": string(),
+            "goal": string(),
+            "status": string(enum=["active", "paused", "completed"]),
+            "state": {
+                "type": "object",
+                "properties": {
+                    "summary": string(),
+                    "next_step": string(),
+                    **{
+                        key: {"type": "array", "items": string()}
+                        for key in ("constraints", "decisions", "open_questions")
+                    },
+                },
+                "additionalProperties": False,
+            },
+        },
+        ["project_id", "revision"],
+    ),
+    tool(
+        "project_link",
+        "Привязать существующий чат к проекту или отвязать по просьбе пользователя. По умолчанию текущий чат.",
+        {
+            "project_id": string(),
+            "conversation_id": string(),
+            "action": string(enum=["attach", "detach"]),
+        },
+        ["action"],
+    ),
+    tool(
+        "project_attach_file",
+        "Связать существующий файл пользователя с проектом.",
+        {
+            "project_id": string(),
+            "artifact_id": string(),
+        },
+        ["project_id", "artifact_id"],
+    ),
     tool(
         "deep_reason",
         "Для сложной логики, математики, сравнения стратегий или неоднозначного плана передай подзадачу reasoning-модели. Выбирай автоматически по сложности.",

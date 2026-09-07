@@ -11,6 +11,7 @@ from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 import asyncpg
 from dateutil.relativedelta import relativedelta
 
+from cronos.projects import ProjectsStoreMixin
 from cronos.settings import Settings
 
 PLANS = {"FREE": 25_000_000, "START": 700_000_000, "PREMIUM": 1_700_000_000, "PRO": 3_700_000_000}
@@ -78,7 +79,7 @@ def privacy_event_id(request_id) -> UUID:
     return uuid5(NAMESPACE_URL, f"cronos:privacy:{uid(request_id)}")
 
 
-class Store:
+class Store(ProjectsStoreMixin):
     def __init__(self, settings: Settings):
         self.settings = settings
         self.pool: asyncpg.Pool | None = None
@@ -949,6 +950,7 @@ class Store:
                 "UPDATE ledger SET description='Account transaction' WHERE user_id=$1", owner
             )
             if full:
+                await conn.execute("DELETE FROM projects WHERE user_id=$1", owner)
                 await conn.execute("DELETE FROM memory WHERE user_id=$1", owner)
                 await conn.execute("DELETE FROM artifacts WHERE user_id=$1", owner)
                 await conn.execute("DELETE FROM deleted_topics WHERE user_id=$1", owner)
@@ -2327,6 +2329,7 @@ async def migrate(settings: Settings):
         async with conn.transaction():
             await conn.execute("SELECT pg_advisory_xact_lock(903125)")
             await conn.execute(Path(__file__).with_name("schema.sql").read_text())
+            await conn.execute(Path(__file__).with_name("projects.sql").read_text())
     finally:
         await conn.close()
 
