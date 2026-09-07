@@ -88,6 +88,7 @@ def case(tmp_path):
         memories=AsyncMock(return_value=[]),
         query_memories=AsyncMock(return_value=[]),
         history=AsyncMock(return_value=[]),
+        conversation_recall=AsyncMock(return_value=[]),
         list_artifacts=AsyncMock(return_value=[]),
         list_schedules=AsyncMock(return_value=[]),
         get_project=AsyncMock(return_value=None),

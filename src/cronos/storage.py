@@ -11,6 +11,7 @@ from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 import asyncpg
 from dateutil.relativedelta import relativedelta
 
+from cronos.library import LibraryStoreMixin
 from cronos.memory import MemoryStoreMixin
 from cronos.memory_privacy import invalidate_memory_context
 from cronos.projects import ProjectsStoreMixin
@@ -81,7 +82,7 @@ def privacy_event_id(request_id) -> UUID:
     return uuid5(NAMESPACE_URL, f"cronos:privacy:{uid(request_id)}")
 
 
-class Store(ProjectsStoreMixin, MemoryStoreMixin):
+class Store(ProjectsStoreMixin, MemoryStoreMixin, LibraryStoreMixin):
     def __init__(self, settings: Settings):
         self.settings = settings
         self.pool: asyncpg.Pool | None = None
@@ -1556,12 +1557,15 @@ class Store(ProjectsStoreMixin, MemoryStoreMixin):
                     raise ValueError("Запрос отменён или уже заменён новым запуском")
             matches = []
             needle = query.casefold()
-            async for fact in conn.cursor("SELECT id,content FROM memory WHERE user_id=$1", user_id):
+            async for fact in conn.cursor(
+                "SELECT id,content FROM memory WHERE user_id=$1", user_id
+            ):
                 if needle in fact["content"].casefold() or str(fact["id"]) == query:
                     matches.append(fact["id"])
             deleted = await conn.fetch(
                 "DELETE FROM memory WHERE user_id=$1 AND id=ANY($2::uuid[]) RETURNING content",
-                user_id, matches,
+                user_id,
+                matches,
             )
             await invalidate_memory_context(conn, user_id)
             # Rotating all active context prevents facts returning through a checkpoint or paraphrase.
@@ -2359,6 +2363,7 @@ async def migrate(settings: Settings):
             await conn.execute(Path(__file__).with_name("projects.sql").read_text())
             await conn.execute(Path(__file__).with_name("memory_privacy.sql").read_text())
             await conn.execute(Path(__file__).with_name("memory.sql").read_text())
+            await conn.execute(Path(__file__).with_name("library.sql").read_text())
     finally:
         await conn.close()
 

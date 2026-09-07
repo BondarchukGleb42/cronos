@@ -249,6 +249,7 @@ async def test_project_graph_create_replay_and_next_run_use_durable_current_stat
         "memories": [],
         "query_memories": [],
         "history": [],
+        "conversation_recall": [],
         "list_artifacts": [],
         "list_schedules": [],
         "run_active": True,

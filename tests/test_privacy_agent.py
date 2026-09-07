@@ -82,6 +82,7 @@ async def test_graph_ends_at_privacy_receipt_without_another_model_or_later_tool
         "memories": [],
         "query_memories": [],
         "history": [],
+        "conversation_recall": [],
         "list_artifacts": [],
         "list_schedules": [],
         "get_project": None,
