@@ -283,6 +283,7 @@ async def test_generated_images_and_final_text_form_one_outbox_with_image_histor
         {
             "image_paths": [f"/tmp/{image_id}.png" for image_id in image_ids],
             "caption": "Два варианта",
+            "format": "rich",
             "reply_markup": navigation_keyboard(),
         },
         f"answer:{case.event['id']}",
@@ -295,6 +296,27 @@ async def test_generated_images_and_final_text_form_one_outbox_with_image_histor
         *[{"type": "image_ref", "artifact_id": image_id} for image_id in image_ids],
     ]
     assert not case.worker.transport._drafts
+
+
+async def test_worker_generated_phonix_caption_reaches_transport_with_bold_entity(answer_case):
+    case = answer_case
+    image_id = str(uuid4())
+    case.worker.agent.run.return_value = {
+        "text": "Логотип **Phonix**",
+        "image_artifact_ids": [image_id],
+    }
+    case.worker.transport.bot.send_photo = AsyncMock(return_value=SimpleNamespace(message_id=51))
+    case.worker.transport.bot.send_message = AsyncMock()
+    await case.worker.answer(case.event, case.conversation, "Нарисуй логотип Phonix")
+    payload = case.worker.store.enqueue_for_run.await_args.args[2]
+    assert payload["format"] == "rich"
+    assert await case.worker.transport.send(USER_ID, THREAD_ID, payload) == [51]
+    sent = case.worker.transport.bot.send_photo.await_args.kwargs
+    assert sent["caption"] == "Логотип Phonix"
+    assert [(entity.type, entity.offset, entity.length) for entity in sent["caption_entities"]] == [
+        ("bold", 8, 6),
+    ]
+    case.worker.transport.bot.send_message.assert_not_awaited()
 
 
 async def test_thinking_refresh_stops_before_final_enqueue_and_keeps_streamed_text(

@@ -12,9 +12,16 @@ from urllib.parse import urlsplit
 from aiogram import Bot
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
-from aiogram.types import FSInputFile, InlineKeyboardMarkup, InputRichMessage, ReplyKeyboardMarkup
+from aiogram.types import (
+    FSInputFile,
+    InlineKeyboardMarkup,
+    InputRichMessage,
+    MessageEntity,
+    ReplyKeyboardMarkup,
+)
 from aiohttp_socks import ProxyConnectionError, ProxyError, ProxyTimeoutError
 
+from cronos.captions import caption_chunks
 from cronos.settings import Settings
 
 logger = logging.getLogger(__name__)
@@ -355,6 +362,8 @@ class TelegramTransport:
             payload = {**payload, "format": "text"}
         if parts is None:
             rich = payload.get("format") == "rich"
+            rich_caption = rich or payload.get("caption_format") == "rich"
+            caption_parts: list[dict[str, Any]]
             text = str(payload.get("text") or "")
             caption_text = str(payload.get("caption") or "")
             image_paths = payload.get("image_paths") or []
@@ -373,12 +382,20 @@ class TelegramTransport:
                     caption_text = text + "\n\n" + caption_text
                 else:
                     caption_text = text or caption_text
-                caption_parts = split_text(caption_text, 1024)
+                caption_parts = (
+                    caption_chunks(caption_text)
+                    if rich_caption
+                    else [
+                        {"text": chunk, "entities": []} for chunk in split_text(caption_text, 1024)
+                    ]
+                )
                 parts = [
                     {
                         "kind": "image",
                         "path": path,
-                        "caption": caption_parts[0] if index == 0 and caption_parts else None,
+                        "caption": caption_parts[0]["text"]
+                        if index == 0 and caption_parts
+                        else None,
                     }
                     for index, path in enumerate(images)
                 ]
@@ -387,8 +404,14 @@ class TelegramTransport:
                     {"kind": "rich" if rich else "text", "text": chunk}
                     for chunk in split_text(text, 12000 if rich else 3900)
                 ]
-                caption_parts = split_text(caption_text, 1024)
-                caption = caption_parts[0] if caption_parts else None
+                caption_parts = (
+                    caption_chunks(caption_text)
+                    if rich_caption
+                    else [
+                        {"text": chunk, "entities": []} for chunk in split_text(caption_text, 1024)
+                    ]
+                )
+                caption = caption_parts[0]["text"] if caption_parts else None
                 if payload.get("document_path"):
                     parts.append(
                         {"kind": "document", "path": payload["document_path"], "caption": caption}
@@ -398,9 +421,17 @@ class TelegramTransport:
                     for index, path in enumerate(images)
                 )
             # Do not truncate model output if it exceeds Telegram's caption limit.
-            parts.extend(
-                {"kind": "text", "text": text} for text in split_text("".join(caption_parts[1:]))
-            )
+            if caption_parts and caption_parts[0]["entities"]:
+                for part in parts:
+                    if part["kind"] in {"image", "document"} and part.get("caption"):
+                        part["caption_entities"] = caption_parts[0]["entities"]
+            if rich_caption:
+                parts.extend({"kind": "text", **chunk} for chunk in caption_parts[1:])
+            else:
+                parts.extend(
+                    {"kind": "text", "text": chunk}
+                    for chunk in split_text("".join(part["text"] for part in caption_parts[1:]))
+                )
             if parts and payload.get("reply_markup"):
                 parts[-1]["reply_markup"] = payload["reply_markup"]
         else:
@@ -438,23 +469,59 @@ class TelegramTransport:
                         text=part["text"],
                         parse_mode=None,
                         reply_markup=markup,
+                        **(
+                            {
+                                "entities": [
+                                    MessageEntity.model_validate(entity)
+                                    for entity in part["entities"]
+                                ]
+                            }
+                            if part.get("entities")
+                            else {}
+                        ),
                     )
-                elif part["kind"] == "document":
-                    message = await self.bot.send_document(
-                        **destination,
-                        document=FSInputFile(part["path"]),
-                        caption=part.get("caption"),
-                        parse_mode=None,
-                        reply_markup=markup,
+                elif part["kind"] in {"document", "image"}:
+                    method = (
+                        self.bot.send_document
+                        if part["kind"] == "document"
+                        else self.bot.send_photo
                     )
-                elif part["kind"] == "image":
-                    message = await self.bot.send_photo(
-                        **destination,
-                        photo=FSInputFile(part["path"]),
-                        caption=part.get("caption"),
-                        parse_mode=None,
-                        reply_markup=markup,
+                    media: dict[str, Any] = {
+                        "document" if part["kind"] == "document" else "photo": FSInputFile(
+                            part["path"]
+                        )
+                    }
+                    caption_options = (
+                        {
+                            "caption_entities": [
+                                MessageEntity.model_validate(entity)
+                                for entity in part["caption_entities"]
+                            ]
+                        }
+                        if part.get("caption_entities")
+                        else {}
                     )
+                    try:
+                        message = await method(
+                            **destination,
+                            **media,
+                            caption=part.get("caption"),
+                            parse_mode=None,
+                            reply_markup=markup,
+                            **caption_options,
+                        )
+                    except TelegramBadRequest as exc:
+                        if not caption_options or not _format_error(exc):
+                            raise
+                        # A definite formatting rejection is safe to retry. Keep
+                        # the rendered readable caption, without exposing Markdown.
+                        message = await method(
+                            **destination,
+                            **media,
+                            caption=part.get("caption"),
+                            parse_mode=None,
+                            reply_markup=markup,
+                        )
                 else:
                     raise ValueError("Unsupported Telegram delivery part")
             except Exception as exc:

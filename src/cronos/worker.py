@@ -627,7 +627,11 @@ class Worker:
                     await self.store.get_artifact(conversation["user_id"], artifact_id)
                     for artifact_id in image_ids
                 ]
-                payload = {"image_paths": [image["path"] for image in images], "caption": answer}
+                payload = {
+                    "image_paths": [image["path"] for image in images],
+                    "caption": answer,
+                    "format": "rich",
+                }
             privacy_request = (
                 await self.store.privacy_request_for_run(run["id"]) if interactive else None
             )
