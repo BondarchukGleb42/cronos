@@ -40,6 +40,13 @@ from cronos.providers import Provider, ProviderError
 from cronos.settings import Settings
 from cronos.storage import Store
 from cronos.topics import create_chat
+from cronos.version_tools import (
+    VERSION_TOOL_NAMES,
+    execute_version_tool,
+    recover_version_link,
+    register_generated_version,
+    version_project,
+)
 
 SCHEDULED_TOOL_NAMES = frozenset(
     {
@@ -61,6 +68,7 @@ SCHEDULED_TOOL_NAMES = frozenset(
         "project_get",
         "library_search",
         "library_read",
+        "artifact_versions",
     }
 )
 
@@ -588,6 +596,8 @@ dynamic=false годится только для отправки заранее
             return await execute_memory_tool(self.store, name, args, op, run, conversation)
         if name in LIBRARY_TOOL_NAMES:
             return await execute_library_tool(self.store, name, args, run, conversation)
+        if name in VERSION_TOOL_NAMES:
+            return await execute_version_tool(self.store, name, args, op, run, conversation)
         if name == "privacy_request":
             request = await self.store.requests_prepare(
                 user,
@@ -674,16 +684,38 @@ dynamic=false годится только для отправки заранее
                 }
             return analyze_table(extracted, args)
         if name == "file_create":
-            artifact = await file_task(
-                self.artifacts.generate,
-                user,
-                args["format"],
-                args["filename"],
-                args["content"],
-                args.get("columns"),
-                args.get("rows"),
-            )
-            await self.store.save_artifact(user, artifact)
+            version = await self.store.version_operation(user, op)
+            if version:
+                await recover_version_link(
+                    self.store, version, op, run, conversation, proactive=proactive
+                )
+                artifact = await self.store.get_artifact(user, version["artifact_id"])
+            else:
+                project_id = await version_project(
+                    self.store, user, conversation, args.get("project_id")
+                )
+                if args.get("parent_artifact_id"):
+                    await self.store.get_artifact(user, args["parent_artifact_id"])
+                artifact = await file_task(
+                    self.artifacts.generate,
+                    user,
+                    args["format"],
+                    args["filename"],
+                    args["content"],
+                    args.get("columns"),
+                    args.get("rows"),
+                )
+                await self.store.save_artifact(user, artifact)
+                version = await register_generated_version(
+                    self.store,
+                    artifact,
+                    args,
+                    op,
+                    run,
+                    conversation,
+                    project_id=project_id,
+                    proactive=proactive,
+                )
             await self.store.enqueue_for_run(
                 run,
                 conversation,
@@ -691,6 +723,7 @@ dynamic=false годится только для отправки заранее
                 op,
             )
             return {
+                **version,
                 "artifact_id": artifact["id"],
                 "filename": artifact["filename"],
                 "delivery": "queued",
@@ -719,6 +752,12 @@ dynamic=false годится только для отправки заранее
             )
             return {"text": result["message"].get("content", ""), "page": args.get("page", 1)}
         if name == "image_generate":
+            version = await self.store.version_operation(user, op)
+            if version:
+                await recover_version_link(
+                    self.store, version, op, run, conversation, proactive=proactive
+                )
+                return {**version, "delivery": "prepared"}
             refs = args.get("artifact_ids")
             if refs is None:
                 refs = [args["artifact_id"]] if args.get("artifact_id") else (image_context or [])
@@ -727,6 +766,11 @@ dynamic=false годится только для отправки заранее
                     "artifact_ids должен быть списком идентификаторов исходных изображений"
                 )
             refs = list(dict.fromkeys(refs))
+            if args.get("parent_artifact_id") and args["parent_artifact_id"] not in refs:
+                refs.insert(0, args["parent_artifact_id"])
+            project_id = await version_project(
+                self.store, user, conversation, args.get("project_id")
+            )
             image_urls = []
             for ref in refs:
                 artifact = await self.store.get_artifact(user, ref)
@@ -744,7 +788,19 @@ dynamic=false годится только для отправки заранее
                 result["data"],
             )
             await self.store.save_artifact(user, artifact)
+            version = await register_generated_version(
+                self.store,
+                artifact,
+                args,
+                op,
+                run,
+                conversation,
+                refs=refs,
+                project_id=project_id,
+                proactive=proactive,
+            )
             return {
+                **version,
                 "artifact_id": artifact["id"],
                 "delivery": "prepared",
                 "reference_artifact_ids": refs,

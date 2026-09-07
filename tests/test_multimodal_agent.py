@@ -81,6 +81,8 @@ def case(tmp_path):
     store = SimpleNamespace(
         get_artifact=AsyncMock(side_effect=lookup),
         save_artifact=AsyncMock(side_effect=save),
+        version_operation=AsyncMock(return_value=None),
+        register_artifact_version=AsyncMock(return_value={}),
         enqueue=AsyncMock(),
         enqueue_for_run=AsyncMock(),
         preferences=AsyncMock(return_value={}),
@@ -143,6 +145,50 @@ def case(tmp_path):
         run={"id": uuid4(), "user_id": owner, "fence": 1},
         conversation={"id": uuid4(), "user_id": owner, "chat_id": owner, "thread_id": 77},
     )
+
+
+async def test_image_replay_recovers_project_link_without_paid_generation(case):
+    artifact_id = case.refs[0]
+    version = {"artifact_id": artifact_id, "project_id": str(uuid4()), "version": 2}
+    case.store.version_operation.return_value = version
+    case.store.attach_project_artifact = AsyncMock()
+    result = await case.agent.execute(
+        "image_generate",
+        {"prompt": "Повтор после сбоя"},
+        "same-operation",
+        case.run,
+        case.conversation,
+    )
+    assert result["artifact_id"] == artifact_id and result["delivery"] == "prepared"
+    case.provider.generate_image.assert_not_awaited()
+    case.store.save_artifact.assert_not_awaited()
+    case.store.attach_project_artifact.assert_awaited_once_with(
+        case.owner,
+        version["project_id"],
+        artifact_id,
+        source_key="same-operation:project-file",
+        run_id=case.run["id"],
+        run_fence=case.run["fence"],
+        conversation_id=case.conversation["id"],
+    )
+
+
+async def test_file_replay_sends_original_without_regenerating(case):
+    artifact_id = case.refs[0]
+    case.store.version_operation.return_value = {"artifact_id": artifact_id, "version": 1}
+    original = case.artifacts[(case.owner, artifact_id)]
+    before = await asyncio.to_thread(Path(original["path"]).read_bytes)
+    result = await case.agent.execute(
+        "file_create",
+        {"format": "invalid-on-purpose"},
+        "same-file",
+        case.run,
+        case.conversation,
+    )
+    assert result["artifact_id"] == artifact_id and result["delivery"] == "queued"
+    assert await asyncio.to_thread(Path(original["path"]).read_bytes) == before
+    case.store.save_artifact.assert_not_awaited()
+    assert case.store.enqueue_for_run.call_args.args[2]["document_path"] == original["path"]
 
 
 @pytest.mark.parametrize("explicit", [False, True])

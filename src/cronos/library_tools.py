@@ -32,7 +32,9 @@ async def execute_library_tool(store, name, args, run, conversation):
     project_id = args.get("project_id")
     if not project_id and args.get("scope", "current_project") == "current_project":
         current = await store.get_project(owner, conversation_id=conversation["id"])
-        project_id = current["id"] if current and not current.get("needs_context") else None
+        if current and current.get("needs_context"):
+            raise ValueError("Контекст проекта очищен. Уточни проект или явно выбери поиск по аккаунту")
+        project_id = current["id"] if current else None
     return await store.library_search(
         owner,
         args["query"],

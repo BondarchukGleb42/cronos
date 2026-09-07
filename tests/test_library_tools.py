@@ -37,3 +37,15 @@ def test_recall_never_searches_binary_payloads_or_attachment_identifiers():
         == "Предыдущее решение"
     )
     assert recall_query([{"type": "image_ref", "artifact_id": "private-id"}]) == ""
+
+
+async def test_cleared_project_never_silently_broadens_search():
+    store = SimpleNamespace(
+        get_project=AsyncMock(return_value={"id": "cleared", "needs_context": True}),
+        library_search=AsyncMock(),
+    )
+    with pytest.raises(ValueError, match="очищен"):
+        await execute_library_tool(
+            store, "library_search", {"query": "бюджет"}, {"user_id": 42}, {"id": "chat"}
+        )
+    store.library_search.assert_not_awaited()

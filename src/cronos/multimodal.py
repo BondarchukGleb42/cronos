@@ -41,7 +41,7 @@ def generated_image_ids(messages: list[dict]) -> list[str]:
             calls.update(
                 call.get("id")
                 for call in message.get("tool_calls", [])
-                if call.get("function", {}).get("name") == "image_generate"
+                if call.get("function", {}).get("name") in {"image_generate", "artifact_restore"}
             )
         elif message.get("role") == "tool" and message.get("tool_call_id") in calls:
             try:
