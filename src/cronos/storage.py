@@ -570,12 +570,35 @@ class Store:
                 dedupe_key,
             )
 
+    async def _active_timer_schedule(self, conn, event_payload, user_id, conversation_id):
+        if not isinstance(event_payload, dict):
+            return None
+        revision = event_payload.get("revision")
+        if not isinstance(revision, int) or isinstance(revision, bool):
+            return None
+        try:
+            schedule_id = uid(event_payload.get("schedule_id"))
+        except TypeError, ValueError:
+            return None
+        return await conn.fetchrow(
+            """SELECT id,revision,chat_id,thread_id FROM schedules
+            WHERE id=$1 AND user_id=$2 AND revision=$3 AND state<>'cancelled'
+            AND conversation_id=$4 FOR SHARE""",
+            schedule_id,
+            user_id,
+            revision,
+            conversation_id,
+        )
+
     async def enqueue_for_run(self, run: dict, conversation: dict, payload: dict, dedupe: str):
         user_id = run["user_id"]
         async with self.connection(user_id) as conn:
             active = await conn.fetchrow(
-                """SELECT id FROM runs WHERE id=$1 AND user_id=$2
-                AND status='running' AND fence=$3 AND NOT cancel_requested FOR SHARE""",
+                """SELECT r.id,r.conversation_id,e.kind AS event_kind,e.payload AS event_payload
+                FROM runs r LEFT JOIN events e ON e.id=r.event_id
+                WHERE r.id=$1 AND r.user_id=$2
+                AND r.status='running' AND r.fence=$3 AND NOT r.cancel_requested
+                FOR SHARE OF r""",
                 uid(run["id"]),
                 user_id,
                 run["fence"],
@@ -590,6 +613,26 @@ class Store:
             )
             if not target:
                 return None
+            if active["event_kind"] == "timer":
+                if active["conversation_id"] != target["id"]:
+                    return None
+                schedule = await self._active_timer_schedule(
+                    conn,
+                    active["event_payload"],
+                    user_id,
+                    target["id"],
+                )
+                if (
+                    not schedule
+                    or schedule["chat_id"] != target["chat_id"]
+                    or schedule["thread_id"] != target["thread_id"]
+                ):
+                    return None
+                payload = {
+                    **payload,
+                    "schedule_id": str(schedule["id"]),
+                    "schedule_revision": schedule["revision"],
+                }
             return await conn.fetchval(
                 """INSERT INTO outbox(user_id,chat_id,thread_id,payload,dedupe_key)
                 VALUES($1,$2,$3,$4,$5) ON CONFLICT(dedupe_key) DO UPDATE
@@ -651,13 +694,22 @@ class Store:
 
     async def run_active(self, run_id, fence):
         async with self.connection() as conn:
-            return bool(
-                await conn.fetchval(
-                    "SELECT status='running' AND NOT cancel_requested AND fence=$2 FROM runs WHERE id=$1",
-                    uid(run_id),
-                    fence,
-                )
+            run = await conn.fetchrow(
+                """SELECT r.user_id,r.conversation_id,e.kind AS event_kind,e.payload AS event_payload
+                FROM runs r LEFT JOIN events e ON e.id=r.event_id
+                WHERE r.id=$1 AND r.status='running' AND NOT r.cancel_requested AND r.fence=$2""",
+                uid(run_id),
+                fence,
             )
+            if not run:
+                return False
+            if run["event_kind"] == "timer":
+                return bool(
+                    await self._active_timer_schedule(
+                        conn, run["event_payload"], run["user_id"], run["conversation_id"]
+                    )
+                )
+            return True
 
     async def finish_run(self, run_id, status="done", fence=None):
         async with self.connection() as conn:
@@ -972,13 +1024,16 @@ class Store:
                 "id": str(row["id"]),
                 "due_at": row["due_at"].isoformat(),
                 "text": row["fixed_text"],
-                "dynamic": dynamic,
+                "dynamic": row["dynamic"],
+                "proactive": row["proactive"],
+                "interval_seconds": row["interval_seconds"],
+                "timezone": row["timezone"],
             }
 
     async def list_schedules(self, user_id):
         async with self.connection() as conn:
             rows = await conn.fetch(
-                "SELECT id,due_at,fixed_text,instruction,dynamic,proactive,state FROM schedules WHERE user_id=$1 AND state='active' ORDER BY due_at",
+                "SELECT id,due_at,fixed_text,instruction,dynamic,proactive,interval_seconds,timezone,state FROM schedules WHERE user_id=$1 AND state='active' ORDER BY due_at",
                 user_id,
             )
             return [

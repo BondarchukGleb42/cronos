@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import uuid4
@@ -74,6 +75,15 @@ async def test_user_cancellation_prevents_final_answer_and_saves_cancelled_statu
     case.worker.store.finish_run.assert_awaited_once_with(case.run["id"], "cancelled", fence=2)
 
 
+async def test_cancelled_delivery_does_not_save_a_completed_answer(worker_case):
+    case = worker_case
+    case.worker.store.enqueue_for_run.return_value = None
+    status = await case.worker.answer(case.event, case.conversation, "Вопрос")
+    assert status == "cancelled"
+    case.worker.store.add_message.assert_not_awaited()
+    case.worker.store.finish_run.assert_awaited_once_with(case.run["id"], "cancelled", fence=2)
+
+
 async def test_provider_failure_keeps_user_error_in_durable_outbox(worker_case):
     case = worker_case
     case.worker.agent.run.side_effect = ProviderError("unavailable")
@@ -106,3 +116,108 @@ async def test_context_save_failure_does_not_mark_entire_event_successful(worker
     # The final message already exists; event replay must use its durable dedupe key.
     assert case.worker.store.enqueue_for_run.await_count == 1
     case.worker.store.finish_run.assert_awaited_once_with(case.run["id"], "failed", fence=2)
+
+
+async def test_explicit_scheduled_report_uses_tools_mode_without_interactive_side_effects(
+    worker_case,
+):
+    case = worker_case
+    schedule = {"id": uuid4(), "revision": 1, "fixed_text": "Цены на огурцы"}
+    status = await case.worker.answer(
+        case.event, case.conversation, "Собери свежий CSV", schedule=schedule
+    )
+    assert status == "done"
+    case.worker.agent.run.assert_awaited_once_with(
+        case.run, case.conversation, "Собери свежий CSV", proactive=False, scheduled=True
+    )
+    case.worker.transport.draft.assert_not_awaited()
+    case.worker.store.add_message.assert_not_awaited()
+    case.worker.store.queue_topic_title.assert_not_awaited()
+    payload = case.worker.store.enqueue_for_run.call_args.args[2]
+    assert "reply_markup" not in payload
+    assert payload["schedule_id"] == str(schedule["id"])
+
+
+@pytest.mark.parametrize("attempt", [1, 2, 3])
+async def test_scheduled_provider_failure_retries_then_reports_failure(worker_case, attempt):
+    case = worker_case
+    case.event["attempts"] = attempt
+    schedule = {"id": uuid4(), "revision": 1, "fixed_text": "🔍 Ищу цены…"}
+    case.worker.agent.run.side_effect = ProviderError("unavailable")
+    with pytest.raises(ProviderError):
+        await case.worker.answer(case.event, case.conversation, "Собери CSV", schedule=schedule)
+    if attempt < 3:
+        case.worker.store.enqueue_for_run.assert_not_awaited()
+    else:
+        payload = case.worker.store.enqueue_for_run.call_args.args[2]
+        assert "Не удалось завершить" in payload["text"]
+        assert "Следующий запуск" not in payload["text"]
+        assert payload["text"] != schedule["fixed_text"]
+        assert payload["schedule_revision"] == 1
+    case.worker.store.finish_run.assert_awaited_once_with(case.run["id"], "failed", fence=2)
+
+
+@pytest.fixture
+def timer_case(worker_case):
+    case = worker_case
+    schedule = {
+        "id": uuid4(),
+        "revision": 1,
+        "state": "active",
+        "dynamic": True,
+        "proactive": False,
+        "user_id": case.conversation["user_id"],
+        "chat_id": case.conversation["chat_id"],
+        "thread_id": case.conversation["thread_id"],
+        "instruction": "Найди свежие цены на огурцы и отправь CSV",
+    }
+    case.event.update(
+        kind="timer",
+        attempts=1,
+        payload={"schedule_id": str(schedule["id"]), "revision": 1, "occurrence_id": str(uuid4())},
+    )
+
+    @asynccontextmanager
+    async def user_lock(_):
+        yield
+
+    case.worker.store.user_lock = user_lock
+    case.worker.store.get_schedule = AsyncMock(return_value=schedule)
+    case.worker.store.occurrence_active = AsyncMock(return_value=True)
+    case.worker.store.preferences = AsyncMock(return_value={"proactivity": False})
+    case.worker.store.conversation = AsyncMock(return_value=case.conversation)
+    case.worker.store.mark_occurrence = AsyncMock()
+    case.worker.answer = AsyncMock(return_value="done")
+    case.schedule = schedule
+    return case
+
+
+async def test_timer_runs_explicit_report_without_general_proactivity_consent(timer_case):
+    case = timer_case
+    await case.worker.timer(case.event)
+    assert case.worker.answer.call_args.kwargs == {"proactive": False, "schedule": case.schedule}
+    case.worker.store.mark_occurrence.assert_awaited_once_with(
+        case.event["payload"]["occurrence_id"]
+    )
+
+
+async def test_completed_occurrence_replay_does_not_regenerate_report(timer_case):
+    case = timer_case
+    case.worker.store.occurrence_active.return_value = False
+    await case.worker.timer(case.event)
+    case.worker.answer.assert_not_awaited()
+
+
+@pytest.mark.parametrize("attempt", [1, 3])
+async def test_timer_generation_failure_is_never_marked_done(timer_case, attempt):
+    case = timer_case
+    case.event["attempts"] = attempt
+    case.worker.answer.side_effect = ProviderError("unavailable")
+    with pytest.raises(ProviderError):
+        await case.worker.timer(case.event)
+    if attempt == 1:
+        case.worker.store.mark_occurrence.assert_not_awaited()
+    else:
+        case.worker.store.mark_occurrence.assert_awaited_once_with(
+            case.event["payload"]["occurrence_id"], "failed"
+        )

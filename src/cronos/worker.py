@@ -333,23 +333,30 @@ class Worker:
         run = await self.store.start_run(event["id"], conversation["user_id"], conversation["id"])
         started, cpu = time.monotonic(), time.process_time()
         status = "failed"
+        interactive = not proactive and schedule is None
         try:
-            if not proactive:
+            if interactive:
                 await self.transport.draft(
                     conversation["chat_id"],
                     conversation["thread_id"],
                     "Сейчас разберусь…",
                     run["id"].int % 2_000_000_000 + 1,
                 )
-            answer = await self.agent.run(run, conversation, prompt, proactive=proactive)
+            answer = await self.agent.run(
+                run, conversation, prompt, proactive=proactive, scheduled=schedule is not None
+            )
             payload = {"text": answer, "format": "rich"}
-            if not proactive:
+            if interactive:
                 payload["reply_markup"] = new_chat_keyboard()
             if schedule:
                 payload["schedule_id"] = str(schedule["id"])
                 payload["schedule_revision"] = schedule["revision"]
-            await self.store.enqueue_for_run(run, conversation, payload, f"answer:{event['id']}")
-            if not proactive:
+            delivery = await self.store.enqueue_for_run(
+                run, conversation, payload, f"answer:{event['id']}"
+            )
+            if delivery is None:
+                raise CancelledRun("Run or scheduled delivery cancelled")
+            if interactive:
                 # Forgotten facts must not reappear through a saved current turn.
                 latest = await self.store.ensure_user(conversation["user_id"])
                 if latest["memory_revision"] == run["memory_revision"]:
@@ -384,6 +391,24 @@ class Worker:
             status = "cancelled"
         except ProviderError:
             status = "failed"
+            if schedule and not proactive:
+                # Keep the durable timer pending for its bounded event retry. A report
+                # fallback must not masquerade as successful task execution.
+                if event.get("attempts", 1) >= 3:
+                    failure_text = "Не удалось завершить задание по расписанию после трёх попыток."
+                    if schedule.get("interval_seconds") is not None:
+                        failure_text += " Следующий запуск остаётся по расписанию."
+                    await self.store.enqueue_for_run(
+                        run,
+                        conversation,
+                        {
+                            "text": failure_text,
+                            "schedule_id": str(schedule["id"]),
+                            "schedule_revision": schedule["revision"],
+                        },
+                        f"schedule-failed:{event['id']}",
+                    )
+                raise
             text = (
                 schedule["fixed_text"]
                 if schedule
@@ -405,6 +430,7 @@ class Worker:
                 time.process_time() - cpu,
                 rss if os.uname().sysname == "Darwin" else rss * 1024,
             )
+        return status
 
     async def timer(self, event):
         data = event["payload"]
@@ -417,6 +443,8 @@ class Worker:
             await self.store.mark_occurrence(data["occurrence_id"], "cancelled")
             return
         async with self.store.user_lock(schedule["user_id"]):
+            if not await self.store.occurrence_active(data["occurrence_id"]):
+                return
             prefs = await self.store.preferences(schedule["user_id"])
             if schedule["proactive"] and not prefs.get("proactivity"):
                 await self.store.mark_occurrence(data["occurrence_id"], "cancelled")
@@ -425,14 +453,23 @@ class Worker:
                 schedule["user_id"], schedule["chat_id"], schedule["thread_id"]
             )
             if schedule["dynamic"]:
-                await self.answer(
-                    event,
-                    conversation,
-                    "Наступило время согласованного обращения. Его цель: "
-                    + schedule["instruction"],
-                    proactive=True,
-                    schedule=schedule,
-                )
+                try:
+                    status = await self.answer(
+                        event,
+                        conversation,
+                        "Наступило время существующего задания. Выполни его сейчас, "
+                        "используя нужные инструменты; не создавай это расписание повторно. "
+                        "Задание: " + schedule["instruction"],
+                        proactive=schedule["proactive"],
+                        schedule=schedule,
+                    )
+                except ProviderError:
+                    if event.get("attempts", 1) >= 3:
+                        await self.store.mark_occurrence(data["occurrence_id"], "failed")
+                    raise
+                if status == "cancelled":
+                    await self.store.mark_occurrence(data["occurrence_id"], "cancelled")
+                    return
             else:
                 await self.store.enqueue(
                     schedule["user_id"],
