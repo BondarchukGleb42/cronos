@@ -12,6 +12,8 @@ import json
 import mimetypes
 import os
 import re
+import shutil
+import stat
 import tempfile
 from datetime import date, datetime, time
 from decimal import Decimal
@@ -463,6 +465,35 @@ class ArtifactManager:
             raise PermissionError("Символические ссылки в каталоге пользователя запрещены")
         directory.mkdir(mode=0o700, exist_ok=True)
         return directory
+
+    def erase_user(self, user_id: int) -> dict:
+        """Remove this owner's complete directory without traversing symlinks.
+
+        The caller holds the same user lock as all file writers. Unlike
+        _user_dir, erasure must never create a directory for an absent owner.
+        """
+        if isinstance(user_id, bool) or not isinstance(user_id, int) or user_id <= 0:
+            raise ValueError("user_id должен быть положительным целым числом")
+        if not shutil.rmtree.avoids_symlink_attacks:
+            raise RuntimeError("Безопасное удаление файлов недоступно на этой платформе")
+        try:
+            root_fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        except FileNotFoundError:
+            return {"removed": False}
+        try:
+            name = str(user_id)
+            try:
+                info = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+                if stat.S_ISDIR(info.st_mode):
+                    shutil.rmtree(name, dir_fd=root_fd)
+                else:
+                    # Unlink the owner's entry itself, including dangling symlinks.
+                    os.unlink(name, dir_fd=root_fd)
+            except FileNotFoundError:
+                return {"removed": False}
+            return {"removed": True}
+        finally:
+            os.close(root_fd)
 
     def ingest(self, user_id: int, filename: str, data: bytes) -> dict:
         directory = self._user_dir(user_id)

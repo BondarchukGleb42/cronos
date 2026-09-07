@@ -89,6 +89,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         for command, description in (
                             ("new", "Новый чат"),
                             ("chats", "Мои чаты"),
+                            ("delete", "Удалить текущий чат"),
+                            ("clearall", "Полная очистка данных"),
                             ("stop", "Остановить ответ"),
                             ("plans", "Тестовые тарифы"),
                             ("start", "Начать общение"),

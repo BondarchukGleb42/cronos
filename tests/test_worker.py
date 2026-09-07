@@ -24,6 +24,7 @@ def worker_case():
         ensure_user=AsyncMock(return_value={"memory_revision": 0}),
         add_message=AsyncMock(),
         queue_topic_title=AsyncMock(),
+        privacy_request_for_run=AsyncMock(return_value=None),
         finish_run=AsyncMock(),
         run_metrics=AsyncMock(),
     )

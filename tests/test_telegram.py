@@ -362,11 +362,15 @@ async def test_edit_topic_rejects_invalid_thread_before_api_call(transport, thre
 
 def test_chat_keyboard_uses_creation_callback_and_honest_bot_link():
     assert new_chat_keyboard() == {
-        "inline_keyboard": [[{"text": "➕ Новый чат", "callback_data": "chat:new"}]]
+        "inline_keyboard": [
+            [{"text": "➕ Новый чат", "callback_data": "chat:new"}],
+            [{"text": "🗑 Удалить этот чат", "callback_data": "chat:delete"}],
+        ]
     }
     keyboard = chat_navigation_keyboard("@cronos_ait_bot")
     assert keyboard["inline_keyboard"] == [
         [{"text": "➕ Новый чат", "callback_data": "chat:new"}],
+        [{"text": "🗑 Удалить этот чат", "callback_data": "chat:delete"}],
         [{"text": "Открыть Cronos", "url": "https://t.me/cronos_ait_bot"}],
     ]
     assert chat_navigation_keyboard() == new_chat_keyboard()

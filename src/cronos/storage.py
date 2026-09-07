@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import json
+import re
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -26,11 +27,53 @@ def uid(value):
     return value if isinstance(value, UUID) else UUID(str(value))
 
 
+def sanitized_usage(value: dict) -> dict:
+    """Keep accounting/receipt fields, never arbitrary provider response content."""
+    keys = {
+        "prompt_tokens",
+        "completion_tokens",
+        "cost_rub",
+        "model",
+        "provider",
+        "request_id",
+        "token_counts_known",
+        "reconciliation",
+        "charged_to",
+        "late_receipt",
+    }
+    return {
+        key: item
+        for key, item in value.items()
+        if key in keys and isinstance(item, (str, int, float, bool, type(None)))
+    }
+
+
+def telegram_message(update: dict) -> dict:
+    for key in ("message", "edited_message", "stopped_message_generation", "my_chat_member"):
+        if isinstance(update.get(key), dict):
+            return update[key]
+    return (update.get("callback_query") or {}).get("message") or {}
+
+
+def telegram_owner(update: dict) -> int | None:
+    message = telegram_message(update)
+    chat = message.get("chat") or {}
+    if chat.get("type") == "private" and isinstance(chat.get("id"), int):
+        return chat["id"]
+    sender = (update.get("callback_query") or {}).get("from") or message.get("from") or {}
+    return sender.get("id") if isinstance(sender.get("id"), int) else None
+
+
+def privacy_event_id(request_id) -> UUID:
+    return uuid5(NAMESPACE_URL, f"cronos:privacy:{uid(request_id)}")
+
+
 class Store:
     def __init__(self, settings: Settings):
         self.settings = settings
         self.pool: asyncpg.Pool | None = None
-        self._user_lock_slots = asyncio.Semaphore(4)
+        self._user_lock_slots = asyncio.Semaphore(3)
+        self._delivery_lock_slots = asyncio.Semaphore(3)
 
     async def open(self):
         async def init(conn):
@@ -51,15 +94,19 @@ class Store:
             await self.pool.close()
 
     @asynccontextmanager
-    async def user_lock(self, user_id: int):
+    async def user_lock(self, user_id: int, purpose: str = "work"):
         """Serialize a user's topics across processes without exhausting the pool."""
         if self.pool is None:
             raise RuntimeError("Database is not connected")
+        if purpose not in {"work", "delivery"}:
+            raise ValueError("Unknown user lock purpose")
+        namespace = "user" if purpose == "work" else "delivery"
         key = int.from_bytes(
-            hashlib.blake2b(f"cronos:user:{user_id}".encode(), digest_size=8).digest(),
+            hashlib.blake2b(f"cronos:{namespace}:{user_id}".encode(), digest_size=8).digest(),
             signed=True,
         )
-        async with self._user_lock_slots:
+        slots = self._user_lock_slots if purpose == "work" else self._delivery_lock_slots
+        async with slots:
             connection = None
             while connection is None:
                 candidate = await self.pool.acquire()
@@ -125,7 +172,15 @@ class Store:
                 )
                 if not lease or lease["owner"] != owner or not lease["active"]:
                     return False
-            for update in updates:
+            for original in updates:
+                update, privacy_confirmed = await self._ingress_privacy(conn, original)
+                if update is None:
+                    await conn.execute(
+                        "INSERT INTO events(id,update_id,payload,state) VALUES($1,$2,'{}','done') ON CONFLICT(update_id) DO NOTHING",
+                        uuid4(),
+                        original["update_id"],
+                    )
+                    continue
                 inserted = await conn.fetchval(
                     """INSERT INTO events(id,update_id,payload) VALUES($1,$2,$3)
                     ON CONFLICT(update_id) DO NOTHING RETURNING id""",
@@ -135,6 +190,11 @@ class Store:
                 )
                 if not inserted:
                     continue
+                if privacy_confirmed:
+                    await conn.execute(
+                        "UPDATE runs SET cancel_requested=true WHERE user_id=$1 AND status='running'",
+                        telegram_owner(update),
+                    )
                 msg = update.get("message", {})
                 sender = msg.get("from", {})
                 if (
@@ -171,6 +231,694 @@ class Store:
                 updated_at=now()""",
                 {"offset": next_offset},
             )
+            return True
+
+    async def _ingress_privacy(self, conn, update):
+        user_id = telegram_owner(update)
+        if user_id is None:
+            return update, False
+        await conn.execute("SELECT set_config('app.user_id',$1,true)", str(user_id))
+        user = await conn.fetchrow(
+            "SELECT content_reset_at FROM users WHERE user_id=$1 FOR SHARE", user_id
+        )
+        if not user:
+            return update, False
+        message = telegram_message(update)
+        thread = message.get("message_thread_id") or 0
+        chat_id = (message.get("chat") or {}).get("id")
+        text = (message.get("text") or "").strip().casefold().rstrip(".! ")
+        callback = update.get("callback_query") or {}
+        control, confirms = None, False
+        data = callback.get("data") or ""
+        if data.startswith(("privacy:confirm:", "privacy:cancel:")):
+            try:
+                token = uid(data.split(":", 2)[2])
+            except ValueError, TypeError:
+                token = None
+            if token is not None and (callback.get("from") or {}).get("id") == user_id:
+                control = await conn.fetchrow(
+                    """SELECT * FROM privacy_requests WHERE id=$1 AND user_id=$2
+                    AND origin_thread_id=$3 AND expires_at>now()
+                    AND state IN ('pending','ready','erasing')""",
+                    token,
+                    user_id,
+                    thread,
+                )
+                confirms = bool(control and data.startswith("privacy:confirm:"))
+        else:
+            scope = {"подтверждаю полную очистку": "all", "подтверждаю удаление чата": "chat"}.get(
+                text
+            )
+            if scope and not (message.get("from") or {}).get("is_bot"):
+                control = await conn.fetchrow(
+                    """SELECT * FROM privacy_requests WHERE user_id=$1 AND origin_thread_id=$2
+                    AND scope=$3 AND state IN ('pending','ready','erasing') AND expires_at>now()
+                    ORDER BY created_at DESC LIMIT 1""",
+                    user_id,
+                    thread,
+                    scope,
+                )
+                confirms = bool(control)
+        erasing = await conn.fetchval(
+            "SELECT 1 FROM privacy_requests WHERE user_id=$1 AND state='erasing'", user_id
+        )
+        if erasing and not control and message_command(text) != "/clearall":
+            return None, False
+        tombstones = await conn.fetch(
+            "SELECT thread_id,deleted_at FROM deleted_topics WHERE user_id=$1 AND chat_id=$2",
+            user_id,
+            chat_id,
+        )
+        deleted = {row["thread_id"]: row["deleted_at"] for row in tombstones}
+        cutoff = user["content_reset_at"]
+        topic_cutoff = deleted.get(thread)
+        if topic_cutoff and thread > 1 and not control:
+            return None, False
+        if topic_cutoff and (cutoff is None or topic_cutoff > cutoff):
+            cutoff = topic_cutoff
+        timestamp = message.get("date")
+        if (
+            cutoff
+            and isinstance(timestamp, (int, float))
+            and timestamp <= int(cutoff.timestamp())
+            and not control
+        ):
+            return None, False
+        if erasing or (control and (cutoff or deleted)):
+            # Cleanup controls need IDs and a nonce, never profile names or old content.
+            minimal_message = {
+                "message_id": message.get("message_id"),
+                "date": message.get("date"),
+                "chat": {"id": chat_id, "type": "private"},
+                "message_thread_id": thread,
+                "from": {"id": user_id, "is_bot": False},
+            }
+            if callback:
+                return {
+                    "update_id": update["update_id"],
+                    "callback_query": {
+                        "id": callback.get("id"),
+                        "from": {"id": user_id, "is_bot": False},
+                        "data": data,
+                        "message": minimal_message,
+                    },
+                }, confirms
+            minimal_message["text"] = "/clearall" if message_command(text) == "/clearall" else text
+            return {"update_id": update["update_id"], "message": minimal_message}, confirms
+        if cutoff or deleted:
+            # A new update must not bring back an old quoted/replied-to message.
+            update = json.loads(json.dumps(update))
+            message = telegram_message(update)
+            for key in ("reply_to_message", "external_reply", "quote", "forward_origin"):
+                message.pop(key, None)
+            if update.get("callback_query"):
+                for key in ("text", "caption", "entities", "caption_entities", "reply_markup"):
+                    message.pop(key, None)
+        return update, confirms
+
+    @staticmethod
+    def _privacy_descriptor(row, title=""):
+        if not row:
+            return None
+        result = dict(row)
+        for key in ("id", "conversation_id", "run_id"):
+            if result.get(key) is not None:
+                result[key] = str(result[key])
+        result["thread_id"] = result["target_thread_id"]
+        result["title"] = title
+        result["expires_at"] = result["expires_at"].isoformat()
+        return result
+
+    async def requests_prepare(
+        self, user_id, conversation, scope, target_conversation_id=None, *, source_key, run_id=None
+    ):
+        if scope not in {"all", "chat"}:
+            raise ValueError("Неизвестная область удаления")
+        async with self.connection(user_id) as conn:
+            await conn.fetchval("SELECT user_id FROM users WHERE user_id=$1 FOR UPDATE", user_id)
+            origin = await conn.fetchrow(
+                "SELECT * FROM conversations WHERE user_id=$1 AND id=$2",
+                user_id,
+                uid(conversation["id"]),
+            )
+            if not origin:
+                raise ValueError("Чат не найден")
+            existing = await conn.fetchrow(
+                "SELECT * FROM privacy_requests WHERE source_key=$1 AND user_id=$2",
+                source_key,
+                user_id,
+            )
+            if existing:
+                target = await conn.fetchrow(
+                    "SELECT title FROM conversations WHERE user_id=$1 AND id=$2",
+                    user_id,
+                    existing["conversation_id"],
+                )
+                return self._privacy_descriptor(existing, target["title"] if target else "")
+            if scope == "all":
+                recovering = await conn.fetchrow(
+                    "SELECT * FROM privacy_requests WHERE user_id=$1 AND state='erasing' FOR UPDATE",
+                    user_id,
+                )
+                if recovering:
+                    recovering = await conn.fetchrow(
+                        """UPDATE privacy_requests SET expires_at=now()+interval '15 minutes',
+                        origin_thread_id=$2 WHERE id=$1 RETURNING *""",
+                        recovering["id"],
+                        origin["thread_id"],
+                    )
+                    return self._privacy_descriptor(recovering)
+            target = await conn.fetchrow(
+                "SELECT * FROM conversations WHERE user_id=$1 AND id=$2",
+                user_id,
+                uid(target_conversation_id) if target_conversation_id else origin["id"],
+            )
+            if not target or target["chat_id"] != origin["chat_id"]:
+                raise ValueError("Чат не найден")
+            if run_id and not await conn.fetchval(
+                "SELECT 1 FROM runs WHERE id=$1 AND user_id=$2", uid(run_id), user_id
+            ):
+                raise ValueError("Запрос не найден")
+            await conn.execute(
+                """UPDATE privacy_requests SET state='cancelled' WHERE user_id=$1
+                AND origin_thread_id=$2 AND state='pending'""",
+                user_id,
+                origin["thread_id"],
+            )
+            row = await conn.fetchrow(
+                """INSERT INTO privacy_requests(id,user_id,scope,conversation_id,chat_id,
+                target_thread_id,origin_thread_id,run_id,source_key)
+                VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *""",
+                uuid4(),
+                user_id,
+                scope,
+                target["id"] if scope == "chat" else None,
+                origin["chat_id"],
+                target["thread_id"],
+                origin["thread_id"],
+                uid(run_id) if run_id else None,
+                source_key,
+            )
+            return self._privacy_descriptor(row, target["title"])
+
+    async def get_privacy_request(self, user_id, request_id):
+        async with self.connection(user_id) as conn:
+            row = await conn.fetchrow(
+                """SELECT p.*,c.title AS live_title FROM privacy_requests p
+                LEFT JOIN conversations c ON c.id=p.conversation_id AND c.user_id=p.user_id
+                WHERE p.id=$1 AND p.user_id=$2""",
+                uid(request_id),
+                user_id,
+            )
+            result = self._privacy_descriptor(row, row["live_title"] or "" if row else "")
+            if result:
+                result.pop("live_title", None)
+            return result
+
+    async def pending_privacy_request(self, user_id, origin_thread_id, scope=None):
+        async with self.connection(user_id) as conn:
+            row = await conn.fetchrow(
+                """SELECT p.*,c.title AS live_title FROM privacy_requests p
+                LEFT JOIN conversations c ON c.id=p.conversation_id AND c.user_id=p.user_id
+                WHERE p.user_id=$1 AND p.origin_thread_id=$2
+                AND (p.state='pending' OR ($3::text IS NOT NULL AND p.state IN ('ready','erasing')))
+                AND p.expires_at>now() AND ($3::text IS NULL OR p.scope=$3)
+                ORDER BY p.created_at DESC LIMIT 1""",
+                user_id,
+                origin_thread_id or 0,
+                scope,
+            )
+            result = self._privacy_descriptor(row, row["live_title"] or "" if row else "")
+            if result:
+                result.pop("live_title", None)
+            return result
+
+    async def privacy_request_for_run(self, run_id):
+        async with self.connection() as conn:
+            row = await conn.fetchrow(
+                """SELECT * FROM privacy_requests WHERE run_id=$1 AND state='pending'
+                AND expires_at>now() ORDER BY created_at DESC LIMIT 1""",
+                uid(run_id),
+            )
+            return self._privacy_descriptor(row)
+
+    async def confirm_privacy_request(self, user_id, request_id, origin_thread_id):
+        async with self.connection(user_id) as conn:
+            await conn.fetchval("SELECT user_id FROM users WHERE user_id=$1 FOR UPDATE", user_id)
+            row = await conn.fetchrow(
+                """SELECT * FROM privacy_requests WHERE id=$1 AND user_id=$2
+                FOR UPDATE""",
+                uid(request_id),
+                user_id,
+            )
+            if not row or row["state"] == "cancelled":
+                return None
+            if row["state"] == "done":
+                return self._privacy_descriptor(row)
+            if row["origin_thread_id"] != (origin_thread_id or 0) or row[
+                "expires_at"
+            ] <= datetime.now(UTC):
+                return None
+            row = await conn.fetchrow(
+                """UPDATE privacy_requests SET state=CASE WHEN state='pending' THEN 'ready'
+                ELSE state END WHERE id=$1 RETURNING *""",
+                row["id"],
+            )
+            await conn.execute(
+                """INSERT INTO events(id,kind,payload) VALUES($1,'privacy',$2)
+                ON CONFLICT(id) DO UPDATE SET state='pending',attempts=0,owner=NULL,
+                lease_until=NULL,available_at=now(),notified_at=NULL,error=NULL
+                WHERE events.state='failed'""",
+                privacy_event_id(row["id"]),
+                {"user_id": user_id, "request_id": str(row["id"])},
+            )
+            return self._privacy_descriptor(row)
+
+    async def cancel_privacy_request(self, user_id, request_id, origin_thread_id):
+        async with self.connection(user_id) as conn:
+            return bool(
+                await conn.fetchval(
+                    """UPDATE privacy_requests SET state='cancelled' WHERE id=$1 AND user_id=$2
+                AND origin_thread_id=$3 AND state='pending' RETURNING id""",
+                    uid(request_id),
+                    user_id,
+                    origin_thread_id or 0,
+                )
+            )
+
+    async def event_current(self, event_id):
+        async with self.connection() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM events WHERE id=$1 AND payload<>'{}'::jsonb AND state IN ('pending','processing')",
+                uid(event_id),
+            )
+            if not row:
+                return None
+            user_id = row["payload"].get("user_id") or telegram_owner(row["payload"])
+            if row["kind"] != "privacy" and user_id is not None:
+                if await conn.fetchval(
+                    "SELECT 1 FROM privacy_requests WHERE user_id=$1 AND state='erasing'", user_id
+                ):
+                    if telegram_owner(row["payload"]) is None:
+                        return None
+                    payload, _ = await self._ingress_privacy(conn, row["payload"])
+                    if payload is None:
+                        return None
+                    return {**dict(row), "payload": payload}
+            return dict(row)
+
+    async def claimed_delivery(self, delivery_id, owner):
+        async with self.connection() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM outbox WHERE id=$1 AND owner=$2 AND state='sending'",
+                delivery_id,
+                owner,
+            )
+            return dict(row) if row else None
+
+    async def begin_privacy_erasure(self, request_id, event_id):
+        async with self.connection() as conn:
+            # Root holds both advisory locks. The row lock also fences ingress.
+            owner = await conn.fetchval(
+                "SELECT user_id FROM privacy_requests WHERE id=$1", uid(request_id)
+            )
+            if owner is None:
+                return None
+            await conn.execute("SELECT set_config('app.user_id',$1,true)", str(owner))
+            await conn.fetchval("SELECT user_id FROM users WHERE user_id=$1 FOR UPDATE", owner)
+            request = await conn.fetchrow(
+                "SELECT * FROM privacy_requests WHERE id=$1 FOR UPDATE", uid(request_id)
+            )
+            event = await conn.fetchrow(
+                "SELECT * FROM events WHERE id=$1 FOR UPDATE", uid(event_id)
+            )
+            if (
+                not event
+                or event["kind"] != "privacy"
+                or event["payload"].get("user_id") != owner
+                or event["payload"].get("request_id") != str(request["id"])
+                or uid(event_id) != privacy_event_id(request["id"])
+            ):
+                return None
+            if request["state"] == "erasing":
+                return self._privacy_descriptor(request)
+            if request["state"] != "ready":
+                return None
+            full = request["scope"] == "all"
+            conversations = await conn.fetch(
+                """SELECT * FROM conversations WHERE user_id=$1 AND ($2 OR id=$3
+                OR ($4::bigint IN (0,1) AND chat_id=$5 AND thread_id IN (0,1))) FOR UPDATE""",
+                owner,
+                full,
+                request["conversation_id"],
+                request["target_thread_id"],
+                request["chat_id"],
+            )
+            conversation_ids = [row["id"] for row in conversations]
+            runs = await conn.fetch(
+                """SELECT * FROM runs WHERE user_id=$1
+                AND ($2 OR conversation_id=ANY($3::uuid[]) OR id=$4) FOR UPDATE""",
+                owner,
+                full,
+                conversation_ids,
+                request["run_id"],
+            )
+            run_ids = [row["id"] for row in runs]
+            event_ids = {row["event_id"] for row in runs if row["event_id"]}
+            # Commands prepare without a run, but their source event contains the intent.
+            for match in re.findall(
+                r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", request["source_key"]
+            ):
+                source = await conn.fetchval("SELECT payload FROM events WHERE id=$1", uid(match))
+                if source and (telegram_owner(source) == owner or source.get("user_id") == owner):
+                    event_ids.add(uid(match))
+            schedules = await conn.fetch(
+                "SELECT id FROM schedules WHERE user_id=$1 AND ($2 OR conversation_id=ANY($3::uuid[]))",
+                owner,
+                full,
+                conversation_ids,
+            )
+            schedule_ids = [row["id"] for row in schedules]
+            event_ids.update(
+                row["event_id"]
+                for row in await conn.fetch(
+                    "SELECT event_id FROM occurrences WHERE schedule_id=ANY($1::uuid[])",
+                    schedule_ids,
+                )
+            )
+            candidates = await conn.fetch(
+                """SELECT * FROM events WHERE id=ANY($1::uuid[]) OR payload->>'user_id'=$2
+                OR payload#>>'{message,chat,id}'=$2 OR payload#>>'{edited_message,chat,id}'=$2
+                OR payload#>>'{message,from,id}'=$2 OR payload#>>'{edited_message,from,id}'=$2
+                OR payload#>>'{my_chat_member,from,id}'=$2
+                OR payload#>>'{callback_query,from,id}'=$2 OR payload#>>'{callback_query,message,chat,id}'=$2
+                OR payload#>>'{my_chat_member,chat,id}'=$2 OR payload#>>'{stopped_message_generation,chat,id}'=$2""",
+                list(event_ids),
+                str(owner),
+            )
+            topic_ids = {row["thread_id"] for row in conversations if row["thread_id"] > 1}
+            general_ids = set()
+            general_deadlines = {}
+            now_seconds = datetime.now(UTC).timestamp()
+            # Telegram permits <48h; leave five minutes for retries and API latency.
+            deletion_window = 48 * 3600 - 300
+            if full:
+                topic_ids.update(
+                    row["thread_id"]
+                    for row in await conn.fetch(
+                        "SELECT thread_id FROM deleted_topics WHERE user_id=$1 AND chat_id=$2 AND thread_id>1",
+                        owner,
+                        request["chat_id"],
+                    )
+                )
+                for previous in await conn.fetch(
+                    "SELECT job FROM privacy_requests WHERE user_id=$1 AND chat_id=$2 AND state='done'",
+                    owner,
+                    request["chat_id"],
+                ):
+                    for message_id in previous["job"].get("general_message_ids", []):
+                        deadline = (
+                            previous["job"]
+                            .get("general_message_deadlines", {})
+                            .get(str(message_id), 0)
+                        )
+                        if deadline > now_seconds:
+                            general_ids.add(message_id)
+                            general_deadlines[str(message_id)] = deadline
+            request_tokens = [str(request["id"]), request["id"].hex]
+            for candidate in candidates:
+                payload = candidate["payload"]
+                message = telegram_message(payload)
+                thread = message.get("message_thread_id") or 0
+                targeted = (
+                    full
+                    or candidate["id"] in event_ids
+                    or any(token in json.dumps(payload) for token in request_tokens)
+                    or (
+                        message
+                        and (message.get("chat") or {}).get("id") == request["chat_id"]
+                        and (
+                            thread == request["target_thread_id"]
+                            or thread in {0, 1}
+                            and request["target_thread_id"] in {0, 1}
+                        )
+                    )
+                    or payload.get("conversation_id") in {str(x) for x in conversation_ids}
+                )
+                if not targeted or candidate["id"] == uid(event_id):
+                    continue
+                event_ids.add(candidate["id"])
+                if message and (message.get("chat") or {}).get("id") == request["chat_id"]:
+                    if thread > 1 and full:
+                        topic_ids.add(thread)
+                    message_date = message.get("date")
+                    if (
+                        thread in {0, 1}
+                        and isinstance(message.get("message_id"), int)
+                        and isinstance(message_date, (int, float))
+                        and message_date + deletion_window > now_seconds
+                    ):
+                        general_ids.add(message["message_id"])
+                        general_deadlines[str(message["message_id"])] = (
+                            message_date + deletion_window
+                        )
+            request_tokens = [str(request["id"]), request["id"].hex]
+            linked = [str(value) for value in event_ids | set(run_ids)] + request_tokens
+            deliveries = await conn.fetch("SELECT * FROM outbox WHERE user_id=$1 FOR UPDATE", owner)
+            delivery_ids = []
+            for delivery in deliveries:
+                targeted = (
+                    full
+                    or (
+                        delivery["chat_id"] == request["chat_id"]
+                        and (
+                            delivery["thread_id"] == request["target_thread_id"]
+                            or delivery["thread_id"] in {0, 1}
+                            and request["target_thread_id"] in {0, 1}
+                        )
+                    )
+                    or any(
+                        key in delivery["dedupe_key"] or key in json.dumps(delivery["payload"])
+                        for key in linked
+                    )
+                )
+                if not targeted:
+                    continue
+                delivery_ids.append(delivery["id"])
+                if delivery["chat_id"] == request["chat_id"]:
+                    if delivery["thread_id"] > 1 and full:
+                        topic_ids.add(delivery["thread_id"])
+                    delivery_date = delivery["sent_at"] or delivery["created_at"]
+                    deadline = delivery_date.timestamp() + deletion_window
+                    if delivery["thread_id"] in {0, 1} and deadline > now_seconds:
+                        for message_id in delivery["telegram_ids"] or []:
+                            if isinstance(message_id, int):
+                                general_ids.add(message_id)
+                                general_deadlines[str(message_id)] = deadline
+            await conn.execute("DELETE FROM outbox WHERE id=ANY($1::bigint[])", delivery_ids)
+            operations = await conn.fetch(
+                "SELECT id,run_id FROM operations WHERE user_id=$1", owner
+            )
+            operation_ids = [
+                row["id"]
+                for row in operations
+                if full or row["run_id"] in run_ids or any(key in row["id"] for key in linked)
+            ]
+            await conn.execute(
+                "DELETE FROM operations WHERE user_id=$1 AND id=ANY($2::text[])",
+                owner,
+                operation_ids,
+            )
+            for table in ("checkpoint_writes", "checkpoint_blobs", "checkpoints"):
+                if await conn.fetchval("SELECT to_regclass($1)", f"langgraph.{table}"):
+                    await conn.execute(
+                        f"DELETE FROM langgraph.{table} WHERE thread_id=ANY($1::text[])",
+                        [str(value) for value in run_ids],
+                    )
+            await conn.execute(
+                "DELETE FROM run_metrics WHERE user_id=$1 AND ($2 OR run_id=ANY($3::uuid[]))",
+                owner,
+                full,
+                run_ids,
+            )
+            await conn.execute(
+                "DELETE FROM runs WHERE user_id=$1 AND id=ANY($2::uuid[])", owner, run_ids
+            )
+            await conn.execute(
+                "DELETE FROM occurrences WHERE schedule_id=ANY($1::uuid[])", schedule_ids
+            )
+            await conn.execute(
+                "DELETE FROM schedules WHERE user_id=$1 AND id=ANY($2::uuid[])", owner, schedule_ids
+            )
+            await conn.execute(
+                "DELETE FROM messages WHERE user_id=$1 AND conversation_id=ANY($2::uuid[])",
+                owner,
+                conversation_ids,
+            )
+            await conn.execute(
+                "DELETE FROM conversations WHERE user_id=$1 AND id=ANY($2::uuid[])",
+                owner,
+                conversation_ids,
+            )
+            event_ids.discard(uid(event_id))
+            # Telegram update tombstones contain no personal payload and prevent replay.
+            await conn.execute(
+                """UPDATE events SET payload='{}',state='done',error=NULL,owner=NULL,
+                               lease_until=NULL WHERE id=ANY($1::uuid[]) AND update_id IS NOT NULL""",
+                list(event_ids),
+            )
+            await conn.execute(
+                "DELETE FROM events WHERE id=ANY($1::uuid[]) AND update_id IS NULL", list(event_ids)
+            )
+            usage_rows = await conn.fetch(
+                "SELECT operation_id,raw FROM usage WHERE user_id=$1 AND ($2 OR run_id=ANY($3::uuid[]))",
+                owner,
+                full,
+                run_ids,
+            )
+            for usage in usage_rows:
+                await conn.execute(
+                    "UPDATE usage SET raw=$2,run_id=NULL WHERE operation_id=$1 AND user_id=$3",
+                    usage["operation_id"],
+                    sanitized_usage(usage["raw"]),
+                    owner,
+                )
+            await conn.execute(
+                "UPDATE ledger SET description='Account transaction' WHERE user_id=$1", owner
+            )
+            if full:
+                await conn.execute("DELETE FROM memory WHERE user_id=$1", owner)
+                await conn.execute("DELETE FROM artifacts WHERE user_id=$1", owner)
+                await conn.execute("DELETE FROM deleted_topics WHERE user_id=$1", owner)
+                await conn.execute(
+                    """UPDATE users SET preferences=$2,memory_revision=memory_revision+1,
+                                   content_reset_at=clock_timestamp() WHERE user_id=$1""",
+                    owner,
+                    {
+                        "timezone": self.settings.default_timezone,
+                        "proactivity": False,
+                        "tone": "доброжелательно, по делу",
+                        "initiative_limit": 2,
+                    },
+                )
+                await conn.execute(
+                    "DELETE FROM privacy_requests WHERE user_id=$1 AND id<>$2", owner, request["id"]
+                )
+            else:
+                await conn.execute(
+                    """DELETE FROM privacy_requests WHERE user_id=$1 AND id<>$2
+                                   AND (conversation_id=$3 OR run_id=ANY($4::uuid[]))""",
+                    owner,
+                    request["id"],
+                    request["conversation_id"],
+                    run_ids,
+                )
+            removed_threads = (
+                ({0, 1} if request["target_thread_id"] in {0, 1} else {request["target_thread_id"]})
+                if not full
+                else set()
+            )
+            for thread in topic_ids | removed_threads:
+                await conn.execute(
+                    """INSERT INTO deleted_topics(user_id,chat_id,thread_id) VALUES($1,$2,$3)
+                                   ON CONFLICT(user_id,chat_id,thread_id) DO UPDATE SET deleted_at=clock_timestamp()""",
+                    owner,
+                    request["chat_id"],
+                    thread,
+                )
+            job = {
+                "delete_user_files": full,
+                "general_message_ids": sorted(general_ids),
+                "general_message_deadlines": general_deadlines,
+                "topic_ids": sorted(topic_ids),
+                "general_history_limited": full or request["target_thread_id"] in {0, 1},
+                "privacy_event_id": str(event_id),
+                "progress": {},
+            }
+            request = await conn.fetchrow(
+                """UPDATE privacy_requests SET state='erasing',job=$2,
+                                          run_id=NULL,conversation_id=NULL,source_key=$3
+                                          WHERE id=$1 RETURNING *""",
+                request["id"],
+                job,
+                f"privacy-erasure:{request['id']}",
+            )
+            return self._privacy_descriptor(request)
+
+    async def finish_privacy_erasure(self, request_id, result):
+        async with self.connection() as conn:
+            owner = await conn.fetchval(
+                "SELECT user_id FROM privacy_requests WHERE id=$1", uid(request_id)
+            )
+            if owner is None:
+                return False
+            await conn.execute("SELECT set_config('app.user_id',$1,true)", str(owner))
+            await conn.fetchval("SELECT user_id FROM users WHERE user_id=$1 FOR UPDATE", owner)
+            request = await conn.fetchrow(
+                "SELECT * FROM privacy_requests WHERE id=$1 FOR UPDATE", uid(request_id)
+            )
+            if request["state"] == "done":
+                return True
+            if request["state"] != "erasing":
+                return False
+            failed_files = bool(result.get("files_failed")) or (
+                request["job"].get("delete_user_files") and not result.get("files_erased")
+            )
+            topics_failed = int(result.get("topics_failed") or 0)
+            messages_failed = int(result.get("messages_failed") or 0)
+            if request["scope"] == "all":
+                text = (
+                    "Данные Cronos очищены."
+                    if not failed_files
+                    else "История, память и настройки Cronos очищены. Не удалось удалить файлы. Для повторной попытки используй /clearall."
+                )
+            else:
+                text = "Чат удалён из Cronos. Общая память и библиотека файлов сохранены."
+            text += " Тариф, баланс и учтённые расходы сохранены."
+            if topics_failed or messages_failed:
+                text += f" В Telegram не удалось удалить тем: {topics_failed}; сообщений: {messages_failed}."
+            if result.get("general_history_limited") or request["job"].get(
+                "general_history_limited"
+            ):
+                text += " Telegram может не разрешить боту удалить сообщения общего чата старше 48 часов; их можно очистить вручную."
+            if request["scope"] == "all":
+                await conn.execute("DELETE FROM outbox WHERE user_id=$1", owner)
+                await conn.execute("DELETE FROM conversations WHERE user_id=$1", owner)
+                await conn.execute(
+                    """UPDATE events SET payload='{}',state='done',owner=NULL,error=NULL,lease_until=NULL
+                    WHERE kind='telegram' AND (payload#>>'{message,chat,id}'=$1
+                    OR payload#>>'{edited_message,chat,id}'=$1 OR payload#>>'{callback_query,from,id}'=$1)""",
+                    str(owner),
+                )
+            await conn.execute(
+                """INSERT INTO outbox(user_id,chat_id,thread_id,payload,dedupe_key)
+                               VALUES($1,$2,0,$3,$4) ON CONFLICT(dedupe_key) DO NOTHING""",
+                owner,
+                request["chat_id"],
+                {"text": text},
+                f"privacy-done:{request['id']}",
+            )
+            await conn.execute(
+                """UPDATE events SET state='done',payload='{}',owner=NULL,error=NULL,lease_until=NULL
+                               WHERE id=$1""",
+                privacy_event_id(request["id"]),
+            )
+            remaining = {}
+            if messages_failed and request["job"].get("general_message_ids"):
+                remaining["general_message_ids"] = request["job"]["general_message_ids"]
+                remaining["general_message_deadlines"] = request["job"].get(
+                    "general_message_deadlines", {}
+                )
+            await conn.execute(
+                """UPDATE privacy_requests SET state='done',job=$2,run_id=NULL,
+                               conversation_id=NULL,target_thread_id=0,origin_thread_id=0 WHERE id=$1""",
+                request["id"],
+                remaining,
+            )
+            if request["scope"] == "all":
+                await conn.execute(
+                    "UPDATE users SET content_reset_at=clock_timestamp() WHERE user_id=$1", owner
+                )
             return True
 
     async def ensure_user(self, user_id: int):
@@ -764,10 +1512,18 @@ class Store:
                 )
 
     async def record_usage(self, user_id: int, run_id, operation_id: str, usage: dict):
+        usage = sanitized_usage(usage)
         cost = usage.get("cost_rub")
         if cost is None:
             # Keep the reservation for reconciliation instead of claiming an unknown call was free.
             async with self.connection(user_id) as conn:
+                await conn.fetchval(
+                    "SELECT user_id FROM users WHERE user_id=$1 FOR UPDATE", user_id
+                )
+                if run_id and not await conn.fetchval(
+                    "SELECT 1 FROM runs WHERE id=$1 AND user_id=$2", uid(run_id), user_id
+                ):
+                    run_id = None
                 await conn.execute(
                     "INSERT INTO usage(operation_id,user_id,run_id,model,raw) VALUES($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING",
                     operation_id,
@@ -782,6 +1538,10 @@ class Store:
             raise ValueError("Стоимость не может быть отрицательной")
         async with self.connection(user_id) as conn:
             user = await conn.fetchrow("SELECT * FROM users WHERE user_id=$1 FOR UPDATE", user_id)
+            if run_id and not await conn.fetchval(
+                "SELECT 1 FROM runs WHERE id=$1 AND user_id=$2", uid(run_id), user_id
+            ):
+                run_id = None
             reservation = await conn.fetchrow(
                 "SELECT * FROM reservations WHERE id=$1 AND user_id=$2 FOR UPDATE",
                 operation_id,

@@ -33,6 +33,12 @@ class _Destination(TypedDict):
     message_thread_id: int | None
 
 
+class MessageDeletionResult(TypedDict):
+    cleared: int
+    failed: int
+    unavailable_ids: list[int]
+
+
 class PartialDeliveryError(Exception):
     """Known successful parts plus a JSON-safe continuation for the sender outbox."""
 
@@ -55,7 +61,12 @@ def upgrade_keyboard() -> dict:
 
 
 def new_chat_keyboard() -> dict:
-    return {"inline_keyboard": [[{"text": "➕ Новый чат", "callback_data": "chat:new"}]]}
+    return {
+        "inline_keyboard": [
+            [{"text": "➕ Новый чат", "callback_data": "chat:new"}],
+            [{"text": "🗑 Удалить этот чат", "callback_data": "chat:delete"}],
+        ]
+    }
 
 
 def chat_navigation_keyboard(bot_username: str | None = None) -> dict:
@@ -78,6 +89,10 @@ def _topic_name(name: str) -> str:
     return (
         " ".join(name.split()).encode("utf-8")[:128].decode("utf-8", errors="ignore") or "Новый чат"
     )
+
+
+def _bad_request_description(error: TelegramBadRequest) -> str:
+    return error.message.strip().casefold().removeprefix("bad request: ")
 
 
 def split_text(text: str, limit: int = 3900) -> list[str]:
@@ -420,3 +435,66 @@ class TelegramTransport:
             if "TOPIC_NOT_MODIFIED" in exc.message.upper():
                 return True
             raise
+
+    async def delete_topic(self, chat_id: int, thread_id: int) -> bool:
+        """Delete a private topic and its entire history; General cannot be deleted."""
+        if thread_id <= 1:
+            raise ValueError("The General topic cannot be deleted; a topic ID above 1 is required")
+        try:
+            return await self.bot.delete_forum_topic(chat_id=chat_id, message_thread_id=thread_id)
+        except TelegramBadRequest as exc:
+            # Do not mistake permission failures or TOPIC_ID_INVALID for an applied retry.
+            if _bad_request_description(exc) in {
+                "topic_not_found",
+                "message thread not found",
+                "forum topic not found",
+            }:
+                return True
+            raise
+
+    async def delete_messages(self, chat_id: int, message_ids: list[int]) -> MessageDeletionResult:
+        """Clear known IDs subject to Telegram's age/service-message restrictions.
+
+        ``cleared`` counts acknowledged deletion OR absence, because deleteMessages
+        silently skips missing IDs. ``unavailable_ids`` contains only known IDs that
+        Telegram explicitly refused to delete. Transient or unknown failures raise;
+        callers may safely retry the same IDs without restoring cleared messages.
+        """
+        if any(type(message_id) is not int or message_id <= 0 for message_id in message_ids):
+            raise ValueError("Positive Telegram message IDs are required")
+        unique_ids = list(dict.fromkeys(message_ids))
+        result: MessageDeletionResult = {"cleared": 0, "failed": 0, "unavailable_ids": []}
+        missing_errors = {"message to delete not found"}
+        undeletable_errors = {"message can't be deleted", "messages can't be deleted"}
+        for start in range(0, len(unique_ids), 100):
+            chunk = unique_ids[start : start + 100]
+            try:
+                acknowledged = await self.bot.delete_messages(chat_id=chat_id, message_ids=chunk)
+            except TelegramBadRequest as exc:
+                if _bad_request_description(exc) not in missing_errors | undeletable_errors:
+                    raise
+            else:
+                if not acknowledged:
+                    raise RuntimeError("Telegram did not acknowledge message deletion")
+                result["cleared"] += len(chunk)
+                continue
+            # A mixed-age batch or topic creation service message may reject a batch.
+            # Isolate those IDs without hiding proxy failures, rate limits or new errors.
+            for message_id in chunk:
+                try:
+                    acknowledged = await self.bot.delete_message(
+                        chat_id=chat_id, message_id=message_id
+                    )
+                except TelegramBadRequest as exc:
+                    description = _bad_request_description(exc)
+                    if description in undeletable_errors:
+                        result["failed"] += 1
+                        result["unavailable_ids"].append(message_id)
+                        continue
+                    if description not in missing_errors:
+                        raise
+                else:
+                    if not acknowledged:
+                        raise RuntimeError("Telegram did not acknowledge message deletion")
+                result["cleared"] += 1
+        return result

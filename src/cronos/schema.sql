@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS users (
 );
 ALTER TABLE users ADD COLUMN IF NOT EXISTS pending_plan text;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS billing_anchor timestamptz;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS content_reset_at timestamptz;
 CREATE TABLE IF NOT EXISTS conversations (
   id uuid PRIMARY KEY, user_id bigint NOT NULL REFERENCES users(user_id), chat_id bigint NOT NULL,
   thread_id bigint NOT NULL DEFAULT 0, title text NOT NULL DEFAULT '', revision integer NOT NULL DEFAULT 0,
@@ -23,6 +24,19 @@ CREATE TABLE IF NOT EXISTS conversations (
 ALTER TABLE conversations ADD COLUMN IF NOT EXISTS title_auto boolean NOT NULL DEFAULT true;
 ALTER TABLE conversations ADD COLUMN IF NOT EXISTS title_message_count integer NOT NULL DEFAULT 0;
 ALTER TABLE conversations ADD COLUMN IF NOT EXISTS title_update_id bigint NOT NULL DEFAULT 0;
+CREATE TABLE IF NOT EXISTS deleted_topics (
+  user_id bigint NOT NULL, chat_id bigint NOT NULL, thread_id bigint NOT NULL,
+  deleted_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY(user_id,chat_id,thread_id)
+);
+CREATE TABLE IF NOT EXISTS privacy_requests (
+  id uuid PRIMARY KEY, user_id bigint NOT NULL, scope text NOT NULL CHECK(scope IN ('all','chat')),
+  conversation_id uuid, chat_id bigint NOT NULL, target_thread_id bigint NOT NULL DEFAULT 0,
+  origin_thread_id bigint NOT NULL DEFAULT 0, run_id uuid, source_key text NOT NULL UNIQUE,
+  state text NOT NULL DEFAULT 'pending' CHECK(state IN ('pending','ready','erasing','done','cancelled')),
+  expires_at timestamptz NOT NULL DEFAULT now()+interval '15 minutes',
+  job jsonb NOT NULL DEFAULT '{}', created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS privacy_requests_owner ON privacy_requests(user_id,state);
 CREATE TABLE IF NOT EXISTS messages (
   id bigserial PRIMARY KEY, user_id bigint NOT NULL REFERENCES users(user_id),
   conversation_id uuid NOT NULL REFERENCES conversations(id), role text NOT NULL,

@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+from copy import deepcopy
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -7,6 +8,35 @@ import pytest
 
 from cronos.coordinator import Coordinator, initiative_delay
 from cronos.telegram import PartialDeliveryError
+
+
+class DeliveryStore(SimpleNamespace):
+    """Represent the current durable row separately from the earlier claim snapshot."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.current_row = deepcopy(self.next_delivery.return_value)
+        self.locked_user = None
+        self.lock_calls = []
+        self.claimed_delivery = AsyncMock(side_effect=self.recheck)
+
+    @asynccontextmanager
+    async def user_lock(self, user_id, *, purpose):
+        assert purpose == "delivery"
+        assert self.locked_user is None
+        self.lock_calls.append((user_id, purpose))
+        self.locked_user = user_id
+        try:
+            yield
+        finally:
+            self.locked_user = None
+
+    async def recheck(self, delivery_id, owner):
+        selected = self.next_delivery.return_value
+        assert self.locked_user == selected["user_id"]
+        assert delivery_id == selected["id"]
+        assert (owner,) == self.next_delivery.await_args.args
+        return self.current_row
 
 
 @pytest.mark.parametrize(
@@ -51,7 +81,7 @@ def test_equal_quiet_boundaries_disable_quiet_hours_but_preserve_cap():
 async def test_delivery_rechecks_schedule_before_sending(schedule):
     coordinator = Coordinator.__new__(Coordinator)
     coordinator.owner = "test-owner"
-    coordinator.store = SimpleNamespace(
+    coordinator.store = DeliveryStore(
         next_delivery=AsyncMock(
             return_value={
                 "id": 1,
@@ -78,7 +108,7 @@ async def test_delivery_rechecks_schedule_before_sending(schedule):
 async def test_delivery_honours_revoked_proactivity():
     coordinator = Coordinator.__new__(Coordinator)
     coordinator.owner = "test-owner"
-    coordinator.store = SimpleNamespace(
+    coordinator.store = DeliveryStore(
         next_delivery=AsyncMock(
             return_value={
                 "id": 2,
@@ -126,7 +156,7 @@ async def test_partial_delivery_persists_ids_remainder_and_schedule_guards():
         },
     }
     remainder = {"_telegram_parts": [{"kind": "document", "path": "/data/report.pdf"}]}
-    coordinator.store = SimpleNamespace(
+    coordinator.store = DeliveryStore(
         next_delivery=AsyncMock(return_value=row),
         get_schedule=AsyncMock(return_value={"state": "active", "revision": 4, "proactive": False}),
         connection=connection,
@@ -147,7 +177,7 @@ async def test_partial_delivery_persists_ids_remainder_and_schedule_guards():
 async def test_successful_remainder_keeps_previously_delivered_ids():
     coordinator = Coordinator.__new__(Coordinator)
     coordinator.owner = "test-owner"
-    coordinator.store = SimpleNamespace(
+    coordinator.store = DeliveryStore(
         next_delivery=AsyncMock(
             return_value={
                 "id": 4,
@@ -165,3 +195,72 @@ async def test_successful_remainder_keeps_previously_delivered_ids():
     coordinator.transport = SimpleNamespace(send=AsyncMock(return_value=[11]))
     assert await coordinator.delivery() is True
     assert coordinator.store.delivery_result.call_args.kwargs["ids"] == [10, 11]
+
+
+async def test_erased_claimed_row_does_not_send_stale_in_memory_content():
+    coordinator = Coordinator.__new__(Coordinator)
+    coordinator.owner = "test-owner"
+    coordinator.store = DeliveryStore(
+        next_delivery=AsyncMock(
+            return_value={
+                "id": 5,
+                "user_id": -920005,
+                "chat_id": -920005,
+                "thread_id": 77,
+                "attempts": 1,
+                "payload": {"text": "content erased before lock acquisition"},
+            }
+        ),
+        delivery_result=AsyncMock(),
+    )
+    coordinator.store.current_row = None
+    coordinator.transport = SimpleNamespace(send=AsyncMock())
+
+    assert await coordinator.delivery() is True
+
+    coordinator.store.claimed_delivery.assert_awaited_once_with(5, "test-owner")
+    assert coordinator.store.lock_calls == [(-920005, "delivery")]
+    assert coordinator.store.locked_user is None
+    coordinator.transport.send.assert_not_called()
+    coordinator.store.delivery_result.assert_not_called()
+
+
+async def test_actual_send_and_receipt_hold_user_lock_and_use_current_payload():
+    coordinator = Coordinator.__new__(Coordinator)
+    coordinator.owner = "test-owner"
+    coordinator.store = DeliveryStore(
+        next_delivery=AsyncMock(
+            return_value={
+                "id": 6,
+                "user_id": -920005,
+                "chat_id": -920005,
+                "thread_id": 77,
+                "attempts": 1,
+                "payload": {"text": "stale snapshot"},
+            }
+        ),
+        delivery_result=AsyncMock(),
+    )
+    coordinator.store.current_row["payload"] = {"text": "current durable content"}
+    coordinator.redis = SimpleNamespace(set=AsyncMock(return_value=True))
+
+    async def send(chat_id, thread_id, payload):
+        assert coordinator.store.locked_user == -920005
+        assert coordinator.store.claimed_delivery.await_count == 1
+        assert (chat_id, thread_id) == (-920005, 77)
+        assert payload == {"text": "current durable content"}
+        return [15]
+
+    async def save_receipt(*args, **kwargs):
+        assert coordinator.store.locked_user == -920005
+        assert kwargs == {"ids": [15]}
+
+    coordinator.transport = SimpleNamespace(send=AsyncMock(side_effect=send))
+    coordinator.store.delivery_result.side_effect = save_receipt
+
+    assert await coordinator.delivery() is True
+
+    coordinator.transport.send.assert_awaited_once()
+    coordinator.store.delivery_result.assert_awaited_once_with(6, "test-owner", ids=[15])
+    assert coordinator.store.lock_calls == [(-920005, "delivery")]
+    assert coordinator.store.locked_user is None

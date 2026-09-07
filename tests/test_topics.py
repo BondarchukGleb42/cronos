@@ -14,6 +14,12 @@ async def unlocked(*args):
     yield
 
 
+async def deliver_telegram(worker, event):
+    event.setdefault("id", uuid4())
+    worker.store.event_current = AsyncMock(return_value=event)
+    await worker.telegram(event)
+
+
 def creation_case(*, enabled=True, inserted=True, result=None):
     conn = SimpleNamespace(fetchval=AsyncMock(return_value="intent" if inserted else None))
 
@@ -161,7 +167,8 @@ async def test_manual_topic_rename_updates_metadata_without_model_reply():
     )
     worker.transport = SimpleNamespace(edit_topic=AsyncMock(return_value=True))
     worker.answer = AsyncMock()
-    await worker.telegram(
+    await deliver_telegram(
+        worker,
         {
             "payload": {
                 "message": {
@@ -172,7 +179,7 @@ async def test_manual_topic_rename_updates_metadata_without_model_reply():
                     "forum_topic_edited": {"name": "Моё название"},
                 }
             }
-        }
+        },
     )
     worker.store.sync_topic_title.assert_awaited_once_with(
         7, 7, 42, "Моё название", manual=True, update_id=100
@@ -195,7 +202,8 @@ async def test_created_topics_respect_implicit_or_explicit_user_names(
         enqueue=AsyncMock(),
     )
     worker.answer = AsyncMock()
-    await worker.telegram(
+    await deliver_telegram(
+        worker,
         {
             "payload": {
                 "message": {
@@ -205,7 +213,7 @@ async def test_created_topics_respect_implicit_or_explicit_user_names(
                     "forum_topic_created": {"name": "Новый чат", "is_name_implicit": implicit},
                 }
             }
-        }
+        },
     )
     worker.store.sync_topic_title.assert_awaited_once_with(
         7, 7, 42, "Новый чат", manual=manual, created=True
@@ -222,7 +230,8 @@ async def test_stale_manual_rename_does_not_overwrite_a_newer_name_in_telegram()
         user_lock=unlocked, sync_topic_title=AsyncMock(return_value=None)
     )
     worker.transport = SimpleNamespace(edit_topic=AsyncMock())
-    await worker.telegram(
+    await deliver_telegram(
+        worker,
         {
             "payload": {
                 "message": {
@@ -233,6 +242,6 @@ async def test_stale_manual_rename_does_not_overwrite_a_newer_name_in_telegram()
                     "forum_topic_edited": {"name": "Старое имя"},
                 }
             }
-        }
+        },
     )
     worker.transport.edit_topic.assert_not_awaited()

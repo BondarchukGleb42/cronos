@@ -76,6 +76,15 @@ class Coordinator:
         row = await self.store.next_delivery(self.owner)
         if not row:
             return False
+        # A cleanup may finish after selection but before sending. It holds this
+        # same lock; never use the previously loaded content without re-reading.
+        async with self.store.user_lock(row["user_id"], purpose="delivery"):
+            row = await self.store.claimed_delivery(row["id"], self.owner)
+            if row is None:
+                return True
+            return await self.deliver_claimed(row)
+
+    async def deliver_claimed(self, row):
         payload = row["payload"]
         try:
             if payload.get("schedule_id"):

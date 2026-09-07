@@ -11,8 +11,15 @@ from uuid import uuid4
 import aio_pika
 
 from cronos.agent import Agent, CancelledRun, setup_checkpoints
+from cronos.file_tasks import file_task
 from cronos.lifecycle import cancel_tasks, close_all, run_until_stopped
 from cronos.logging import configure_logging
+from cronos.privacy import (
+    confirmation_keyboard,
+    confirmation_scope,
+    confirmation_text,
+    perform_erasure,
+)
 from cronos.providers import Provider, ProviderError
 from cronos.settings import get_settings
 from cronos.storage import STOP_COMMANDS, Store, message_command
@@ -46,6 +53,8 @@ class Worker:
             try:
                 if event["kind"] == "timer":
                     await self.timer(event)
+                elif event["kind"] == "privacy":
+                    await perform_erasure(self.store, self.transport, self.agent.artifacts, event)
                 elif event["kind"] in {"topic_title", "topic_title_reset"}:
                     await self.topic_title(event)
                 else:
@@ -75,6 +84,13 @@ class Worker:
             user_id = message["chat"]["id"]
             thread_id = message.get("message_thread_id", 0)
             async with self.store.user_lock(user_id):
+                current = await self.store.event_current(event["id"])
+                if not current:
+                    return
+                message = current["payload"].get("message", {})
+                created = message.get("forum_topic_created")
+                edited = message.get("forum_topic_edited")
+                sender = message.get("from", {})
                 if created:
                     topic_conversation = await self.store.sync_topic_title(
                         user_id,
@@ -114,9 +130,25 @@ class Worker:
             return
         chat_id, thread_id = message["chat"]["id"], message.get("message_thread_id", 0)
         async with self.store.user_lock(user_id):
+            current = await self.store.event_current(event["id"])
+            if not current:
+                return
+            update = current["payload"]
+            callback = update.get("callback_query")
+            message = update.get("message") or (callback or {}).get("message")
+            if not message:
+                return
+            text = message.get("text") or message.get("caption") or ""
+            if await self.privacy_control(event, user_id, chat_id, thread_id, text, callback):
+                return
             conversation = await self.store.conversation(user_id, chat_id, thread_id)
             if callback:
                 data = callback.get("data", "")
+                if data == "chat:delete":
+                    with suppress(Exception):
+                        await self.transport.bot.answer_callback_query(callback["id"])
+                    await self.request_deletion(event, conversation, "chat")
+                    return
                 if data == "chat:new":
                     with suppress(Exception):
                         await self.transport.bot.answer_callback_query(
@@ -144,6 +176,11 @@ class Worker:
                 return
             text = message.get("text") or message.get("caption") or ""
             command = message_command(text)
+            if command in {"/delete", "/clearall"}:
+                await self.request_deletion(
+                    event, conversation, "all" if command == "/clearall" else "chat"
+                )
+                return
             if command == "/new":
                 await self.new_chat(event, conversation)
                 return
@@ -217,7 +254,7 @@ class Worker:
                         await self.transport.bot.download_file(
                             metadata.file_path, destination=output
                         )
-                        artifact = await asyncio.to_thread(
+                        artifact = await file_task(
                             self.agent.artifacts.ingest, user_id, filename, output.getvalue()
                         )
                         await self.store.save_artifact(user_id, artifact)
@@ -248,6 +285,65 @@ class Worker:
             if not text:
                 return
             await self.answer(event, conversation, text)
+
+    async def request_deletion(self, event, conversation, scope):
+        request = await self.store.requests_prepare(
+            conversation["user_id"],
+            conversation,
+            scope,
+            source_key=f"privacy-request:{event['id']}",
+        )
+        await self.store.enqueue(
+            conversation["user_id"],
+            conversation["chat_id"],
+            conversation["thread_id"],
+            {"text": confirmation_text(request), "reply_markup": confirmation_keyboard(request)},
+            f"privacy-confirm:{request['id']}",
+        )
+
+    async def privacy_control(self, event, user_id, chat_id, thread_id, text, callback):
+        data = (callback or {}).get("data", "")
+        result_text = None
+        if data.startswith(("privacy:confirm:", "privacy:cancel:")):
+            action, token = data.split(":", 2)[1:]
+            try:
+                if action == "confirm":
+                    request = await self.store.confirm_privacy_request(user_id, token, thread_id)
+                    result_text = (
+                        "Очистка началась" if request else "Подтверждение устарело или недоступно"
+                    )
+                else:
+                    cancelled = await self.store.cancel_privacy_request(user_id, token, thread_id)
+                    result_text = (
+                        "Удаление отменено" if cancelled else "Нет ожидающего подтверждения"
+                    )
+            except ValueError:
+                result_text = "Подтверждение недоступно"
+            with suppress(Exception):
+                await self.transport.bot.answer_callback_query(callback["id"], text=result_text)
+            return True
+        if callback:
+            return False
+        scope = confirmation_scope(text)
+        if scope:
+            request = await self.store.pending_privacy_request(user_id, thread_id, scope)
+            if request and await self.store.confirm_privacy_request(
+                user_id, request["id"], thread_id
+            ):
+                return True
+            result_text = "Нет действующего подтверждения. Используй /clearall для полной очистки или /delete для удаления чата."
+        elif text.strip().casefold() in {"отмена", "/cancel"}:
+            request = await self.store.pending_privacy_request(user_id, thread_id)
+            if not request:
+                return False
+            await self.store.cancel_privacy_request(user_id, request["id"], thread_id)
+            result_text = "Удаление отменено."
+        if result_text:
+            await self.store.enqueue(
+                user_id, chat_id, thread_id, {"text": result_text}, f"privacy-control:{event['id']}"
+            )
+            return True
+        return False
 
     async def new_chat(self, event, conversation):
         result = await create_chat(
@@ -346,8 +442,15 @@ class Worker:
                 run, conversation, prompt, proactive=proactive, scheduled=schedule is not None
             )
             payload = {"text": answer, "format": "rich"}
+            privacy_request = (
+                await self.store.privacy_request_for_run(run["id"]) if interactive else None
+            )
             if interactive:
-                payload["reply_markup"] = new_chat_keyboard()
+                payload["reply_markup"] = (
+                    confirmation_keyboard(privacy_request)
+                    if privacy_request
+                    else new_chat_keyboard()
+                )
             if schedule:
                 payload["schedule_id"] = str(schedule["id"])
                 payload["schedule_revision"] = schedule["revision"]
@@ -356,7 +459,7 @@ class Worker:
             )
             if delivery is None:
                 raise CancelledRun("Run or scheduled delivery cancelled")
-            if interactive:
+            if interactive and not privacy_request:
                 # Forgotten facts must not reappear through a saved current turn.
                 latest = await self.store.ensure_user(conversation["user_id"])
                 if latest["memory_revision"] == run["memory_revision"]:
