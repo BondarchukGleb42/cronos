@@ -315,6 +315,35 @@ async def test_real_graph_remembers_and_replays_without_recalling_model(graph_ca
     )
 
 
+@pytest.mark.parametrize("graph_case", [-920005], indirect=True)
+async def test_real_graph_accepts_empty_optional_memory_ids_from_luna(graph_case):
+    case = graph_case
+    case.provider.complete.side_effect = [
+        model_response(
+            tool="memory_write",
+            args={
+                "content": "Любимая птица пользователя — воробей.",
+                "category": "предпочтения",
+                "scope": "global",
+                "project_id": "",
+                "expires_at": None,
+                "supersedes_id": "",
+            },
+        ),
+        model_response("Запомнил."),
+    ]
+    assert await case.agent.run(case.run, case.conversation, "Запомни любимую птицу") == "Запомнил."
+    memories = await case.store.query_memories(case.user_id)
+    assert len(memories) == 1
+    assert memories[0]["content"] == "Любимая птица пользователя — воробей."
+    assert memories[0]["scope"] == "global"
+    assert memories[0]["project_id"] is None
+    assert memories[0]["supersedes_id"] is None
+    followup = case.provider.complete.await_args.args[0]
+    receipt = json.loads(next(message["content"] for message in followup if message["role"] == "tool"))
+    assert "error" not in receipt
+
+
 @pytest.mark.parametrize("graph_case", [-920002], indirect=True)
 async def test_real_graph_rejects_stale_fence_before_model_or_checkpoint_write(graph_case):
     case = graph_case

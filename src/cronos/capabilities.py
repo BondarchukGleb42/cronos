@@ -76,6 +76,17 @@ SKILLS = {
 
 
 def tool(name, description, properties=None, required=()):
+    properties = dict(properties or {})
+    for key, schema in properties.items():
+        if key.endswith("_id") and key not in required and schema.get("type") == "string":
+            properties[key] = {
+                **schema,
+                "type": ["string", "null"],
+                "description": (
+                    schema.get("description", "")
+                    + " Если ID не задан, передай null или опусти поле."
+                ).strip(),
+            }
     return {
         "type": "function",
         "function": {
@@ -83,7 +94,7 @@ def tool(name, description, properties=None, required=()):
             "description": description,
             "parameters": {
                 "type": "object",
-                "properties": properties or {},
+                "properties": properties,
                 "required": list(required),
                 "additionalProperties": False,
             },
@@ -96,6 +107,23 @@ def string(description="", enum=None):
     if enum:
         value["enum"] = enum
     return value
+
+
+def normalize_tool_arguments(name: str, args: dict) -> dict:
+    """Empty optional IDs mean absence; stores still validate all supplied IDs."""
+    result = dict(args)
+    schema = next(
+        (item["function"]["parameters"] for item in TOOLS if item["function"]["name"] == name),
+        None,
+    )
+    if schema is None:
+        return result
+    for key in schema["properties"]:
+        if key.endswith("_id") and key not in schema["required"] and key in result:
+            value = result[key]
+            if value is None or (isinstance(value, str) and not value.strip()):
+                result.pop(key)
+    return result
 
 
 INITIATIVE_DECISION_SCHEMAS = [
@@ -445,14 +473,18 @@ TOOLS = [
             "content": string(),
             "category": string(),
             "scope": string(enum=["global", "project", "conversation"]),
-            "project_id": string(),
+            "project_id": {
+                "type": ["string", "null"],
+                "description": "ID проекта только при scope=project; null для global/conversation. При scope=project null означает проект текущего чата.",
+            },
             "expires_at": {
                 "type": ["string", "null"],
                 "description": "ISO8601 с часовым поясом; null для постоянного факта",
             },
-            "supersedes_id": string(
-                "ID прежнего факта в той же области действия, который заменяет это исправление"
-            ),
+            "supersedes_id": {
+                "type": ["string", "null"],
+                "description": "ID прежнего факта в той же области действия, который заменяет это исправление; null, если прежний факт не заменяется.",
+            },
         },
         ["content"],
     ),

@@ -23,7 +23,13 @@ from cronos.action_confirmation import (
     needs_schedule_repair,
 )
 from cronos.artifacts import ArtifactManager
-from cronos.capabilities import INITIATIVE_DECISION_SCHEMAS, SKILLS, TOOLS, catalog_context
+from cronos.capabilities import (
+    INITIATIVE_DECISION_SCHEMAS,
+    SKILLS,
+    TOOLS,
+    catalog_context,
+    normalize_tool_arguments,
+)
 from cronos.file_tasks import file_task
 from cronos.file_text import text_window
 from cronos.initiative import INITIATIVE_ALLOWED_TOOLS
@@ -831,6 +837,7 @@ deep_reason доступен только в глубоком режиме; не
         image_context=None,
         initiative=None,
     ):
+        args = normalize_tool_arguments(name, args)
         if initiative is not None:
             if not proactive or not scheduled:
                 raise ValueError("Prepared initiative requires a proactive scheduled run")

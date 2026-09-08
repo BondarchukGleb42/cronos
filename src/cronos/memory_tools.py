@@ -3,6 +3,11 @@
 MEMORY_TOOL_NAMES = frozenset({"memory_write", "memory_update", "memory_list"})
 
 
+def _optional_id(value):
+    """Some models emit empty optional IDs instead of JSON null."""
+    return None if isinstance(value, str) and not value.strip() else value
+
+
 async def execute_memory_tool(store, name, args, op, run, conversation):
     owner = run["user_id"]
     if name == "memory_list":
@@ -26,8 +31,8 @@ async def execute_memory_tool(store, name, args, op, run, conversation):
             run=run,
         )
     scope = args.get("scope", "global")
-    project_id = args.get("project_id")
-    if scope == "project" and not project_id:
+    project_id = _optional_id(args.get("project_id"))
+    if scope == "project" and project_id is None:
         project = await store.get_project(owner, conversation_id=conversation["id"])
         if not project:
             raise ValueError("Сначала выбери проект для этого факта")
@@ -41,7 +46,7 @@ async def execute_memory_tool(store, name, args, op, run, conversation):
         conversation_id=conversation["id"] if scope == "conversation" else None,
         project_id=project_id,
         expires_at=args.get("expires_at"),
-        supersedes_id=args.get("supersedes_id"),
+        supersedes_id=_optional_id(args.get("supersedes_id")),
         source_key=op,
         run=run,
     )
