@@ -21,6 +21,7 @@ from cronos.library import LibraryStoreMixin
 from cronos.memory import MemoryStoreMixin
 from cronos.memory_privacy import invalidate_memory_context
 from cronos.model_preferences import normalize_model_choice
+from cronos.proactivity import APPLY_DEFAULT_SQL
 from cronos.projects import ProjectsStoreMixin
 from cronos.recipes import RecipesStoreMixin
 from cronos.settings import Settings
@@ -979,12 +980,13 @@ class Store(
                 await conn.execute("DELETE FROM artifacts WHERE user_id=$1", owner)
                 await conn.execute("DELETE FROM deleted_topics WHERE user_id=$1", owner)
                 await conn.execute(
-                    """UPDATE users SET preferences=$2,memory_revision=memory_revision+1,
+                    """UPDATE users SET preferences=$2,proactivity_default_applied=true,
+                                   memory_revision=memory_revision+1,
                                    content_reset_at=clock_timestamp() WHERE user_id=$1""",
                     owner,
                     {
                         "timezone": self.settings.default_timezone,
-                        "proactivity": False,
+                        "proactivity": True,
                         "tone": "доброжелательно, по делу",
                         "initiative_limit": 2,
                     },
@@ -1112,16 +1114,20 @@ class Store(
     async def ensure_user(self, user_id: int):
         async with self.connection(user_id) as conn:
             await conn.execute(
-                "INSERT INTO users(user_id,preferences) VALUES($1,$2) ON CONFLICT DO NOTHING",
+                """INSERT INTO users(user_id,preferences,proactivity_default_applied)
+                VALUES($1,$2,true) ON CONFLICT DO NOTHING""",
                 user_id,
                 {
                     "timezone": self.settings.default_timezone,
-                    "proactivity": False,
+                    "proactivity": True,
                     "tone": "доброжелательно, по делу",
                     "initiative_limit": 2,
                 },
             )
             row = await conn.fetchrow("SELECT * FROM users WHERE user_id=$1 FOR UPDATE", user_id)
+            if not row["proactivity_default_applied"]:
+                await conn.execute(APPLY_DEFAULT_SQL, user_id)
+                row = await conn.fetchrow("SELECT * FROM users WHERE user_id=$1", user_id)
             now = datetime.now(UTC)
             if row["period_end"] <= now:
                 plan = row["pending_plan"] or row["plan"]
@@ -2539,6 +2545,7 @@ async def migrate(settings: Settings):
             await conn.execute(Path(__file__).with_name("workflows.sql").read_text())
             await conn.execute(Path(__file__).with_name("recipes.sql").read_text())
             await conn.execute(Path(__file__).with_name("initiative.sql").read_text())
+            await conn.execute(APPLY_DEFAULT_SQL, None)
     finally:
         await conn.close()
 

@@ -226,7 +226,7 @@ async def test_proactivity_toggle_writes_owner_preference_and_renders_fresh_valu
     )
     case.store.preferences.assert_awaited_once_with(42)
     panel = case.store.enqueue_home_panel.call_args.args[3]
-    assert ("Писать первым: разрешено" if expected else "Писать первым: выключено") in panel["text"]
+    assert ("Писать первым: включено" if expected else "Писать первым: выключено") in panel["text"]
     case.worker.answer.assert_not_awaited()
 
 

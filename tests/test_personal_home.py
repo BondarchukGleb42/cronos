@@ -143,6 +143,7 @@ async def test_first_use_has_no_invented_projects_or_mutations(store):
         "results": [],
         "tasks": 0,
         "suggestions": True,
+        "proactivity": True,
     }
     text = (await personal_main_panel(store, A))["text"]
     assert "Начни со своей задачи" in text and "Вот где можно продолжить" not in text
@@ -150,6 +151,15 @@ async def test_first_use_has_no_invented_projects_or_mutations(store):
         for table in ("projects", "conversations", "operations", "outbox"):
             assert await conn.fetchval(f"SELECT count(*) FROM {table} WHERE user_id=$1", A) == 0
         assert await conn.fetchval("SELECT amount_micro FROM ledger WHERE user_id=$1", A) == 123
+
+
+async def test_home_reads_explicit_off_and_does_not_change_it_on_render(store):
+    await store.set_proactivity(A, False, f"home-off:{A}")
+    assert (await home_overview(store, A))["proactivity"] is False
+    text = (await personal_main_panel(store, A))["text"]
+    assert "Инициатива выключена" in text
+    assert "Инициатива включена" not in text
+    assert (await store.preferences(A))["proactivity"] is False
 
 
 async def test_active_owner_projects_only_and_changed_revision_reappears(store):

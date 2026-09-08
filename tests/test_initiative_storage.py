@@ -136,9 +136,9 @@ async def decide(case, policy, evidence="Москва: огурцы 130 руб/�
     return await case.store.decide_initiative(**parameters)
 
 
-async def test_configuration_requires_consent_and_rejects_mutating_tools(case):
+async def test_configuration_respects_explicit_off_and_rejects_mutating_tools(case):
     await case.store.preferences(A, {"proactivity": False})
-    with pytest.raises(ValueError, match="agreement"):
+    with pytest.raises(ValueError, match="Proactivity is disabled"):
         await configure(case)
     await case.store.preferences(A, {"proactivity": True})
     for tool in (

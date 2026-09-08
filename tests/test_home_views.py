@@ -51,7 +51,7 @@ def test_main_navigation_routes_match_public_contract():
         "home:memory:0",
         "home:settings",
     ]
-    assert "разрешения" in panel["text"]
+    assert "Инициатива включена" in panel["text"]
 
 
 def test_guide_lists_supported_files_and_natural_controls():
@@ -194,6 +194,22 @@ def test_settings_show_real_preferences_and_opposite_toggle(proactivity):
         "home:main",
     ]
     assert "после отдельного подтверждения" in panel["text"]
+
+
+def test_missing_proactivity_defaults_to_enabled_in_home_and_settings():
+    assert "Инициатива включена" in main_panel()["text"]
+    panel = settings_panel({})
+    assert "Писать первым: включено" in panel["text"]
+    assert callbacks(panel)[0] == "home:proactivity:off"
+    assert "включена по умолчанию" in guide_panel()["text"]
+
+
+def test_home_respects_explicit_off_without_suggesting_another_consent_step():
+    panel = main_panel({"proactivity": False})
+    assert "Инициатива выключена" in panel["text"]
+    assert "Явные напоминания продолжают работать" in panel["text"]
+    assert "Инициатива включена" not in panel["text"]
+    assert "Писать первым: выключено" in settings_panel({"proactivity": False})["text"]
 
 
 def test_memory_paginates_eight_records_and_keeps_shared_memory_explanation():

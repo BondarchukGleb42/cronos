@@ -50,6 +50,7 @@ async def home_overview(store, user_id):
         "results": [{**r, "id": str(r["id"])} for r in results],
         "tasks": tasks,
         "suggestions": preferences.get("home_suggestions", True) is not False,
+        "proactivity": bool(preferences.get("proactivity", True)),
     }
 
 

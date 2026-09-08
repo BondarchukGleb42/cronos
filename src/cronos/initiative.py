@@ -311,7 +311,7 @@ class InitiativeStoreMixin:
                 return _public(row)
             prefs = await conn.fetchval("SELECT preferences FROM users WHERE user_id=$1", user_id)
             if prefs.get("proactivity") is not True:
-                raise ValueError("User agreement to proactivity is required before configuration")
+                raise ValueError("Proactivity is disabled")
             project = await conn.fetchrow(
                 """SELECT p.* FROM projects p JOIN project_conversations pc
                 ON pc.user_id=p.user_id AND pc.project_id=p.id

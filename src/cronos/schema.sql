@@ -17,6 +17,7 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS pending_plan text;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS billing_anchor timestamptz;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS content_reset_at timestamptz;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS home_generation uuid NOT NULL DEFAULT gen_random_uuid();
+ALTER TABLE users ADD COLUMN IF NOT EXISTS proactivity_default_applied boolean NOT NULL DEFAULT false;
 CREATE TABLE IF NOT EXISTS conversations (
   id uuid PRIMARY KEY, user_id bigint NOT NULL REFERENCES users(user_id), chat_id bigint NOT NULL,
   thread_id bigint NOT NULL DEFAULT 0, title text NOT NULL DEFAULT '', revision integer NOT NULL DEFAULT 0,
