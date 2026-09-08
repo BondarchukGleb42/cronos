@@ -16,17 +16,18 @@ class Settings(BaseSettings):
     alltokens_api_key: SecretStr = SecretStr("")
     alltokens_base_url: str = "https://api.alltokens.ru/api/v1"
     provider_tls12: bool = False
-    model_free: str = "deepseek/deepseek-v4-flash"
-    model_tools: str = "deepseek/deepseek-v4-flash"
-    model_vision: str = "qwen/qwen3.7-flash"
-    model_reasoning: str = "deepseek/deepseek-v4-flash"
+    model_free: str = "openai/gpt-5.6-luna"
+    model_tools: str = "openai/gpt-5.6-luna"
+    model_vision: str = "openai/gpt-5.6-luna"
+    model_reasoning: str = "openai/gpt-5.6-luna"
     model_search: str = "perplexity/sonar"
     model_image: str = "google/gemini-3.1-flash-image-preview"
     model_title: str = "meta-llama/llama-3.1-8b-instruct"
-    model_fallbacks: str = "meta-llama/llama-3.1-8b-instruct,inclusionai/ling-3.0-flash"
+    model_fallbacks: str = "openai/gpt-5.6-luna"
     alpha_soft_limits: bool = True
     max_model_steps: int = Field(default=8, ge=1, le=24)
     max_output_tokens: int = Field(default=4096, ge=64, le=32768)
+    reasoning_max_output_tokens: int = Field(default=16384, ge=64, le=32768)
     max_run_cost_rub: float = Field(default=25, gt=0)
     proactive_max_cost_rub: float = Field(default=1, gt=0)
     provider_timeout_seconds: float = 120

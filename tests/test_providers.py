@@ -4,6 +4,7 @@ import json
 import httpx
 import pytest
 
+from cronos.model_preferences import DIALOGUE_MODELS
 from cronos.providers import Provider, ProviderError, normalize_usage
 from cronos.settings import Settings
 
@@ -74,7 +75,11 @@ async def test_free_fallback_chain_is_three_attempts_without_sdk_retries():
         models.append(json.loads(request.content)["model"])
         return httpx.Response(503, json={"error": {"message": "unavailable"}})
 
-    p = provider(handler, model_free="mistralai/mistral-nemo")
+    p = provider(
+        handler,
+        model_free="mistralai/mistral-nemo",
+        model_fallbacks="meta-llama/llama-3.1-8b-instruct,inclusionai/ling-3.0-flash",
+    )
     try:
         with pytest.raises(ProviderError) as exc:
             await p.complete([{"role": "user", "content": "hello"}])
@@ -101,6 +106,7 @@ async def test_tools_route_uses_auto_choice_and_has_one_usage_receipt():
         return httpx.Response(
             200,
             json=completion(
+                model=body["model"],
                 message={
                     "role": "assistant",
                     "content": None,
@@ -111,16 +117,18 @@ async def test_tools_route_uses_auto_choice_and_has_one_usage_receipt():
                             "function": {"name": "web_search", "arguments": "{}"},
                         }
                     ],
-                }
+                },
             ),
         )
 
     p = provider(handler)
     try:
         result = await p.complete([{"role": "user", "content": "search"}], tools=[tool])
-        assert requests[0]["model"] == "deepseek/deepseek-v4-flash"
+        assert requests[0]["model"] == DIALOGUE_MODELS["luna"]
         assert requests[0]["tool_choice"] == "auto"
-        assert requests[0]["reasoning"] == {"enabled": False}
+        assert requests[0]["reasoning_effort"] == "none"
+        assert requests[0]["max_completion_tokens"] == p.settings.max_output_tokens
+        assert "reasoning" not in requests[0] and "max_tokens" not in requests[0]
         assert result["message"]["tool_calls"][0]["id"] == "call-1"
         assert result["usage"]["cost_rub"] == "0.002252988"
         assert len(requests) == 1
@@ -137,7 +145,7 @@ async def test_explicit_tools_model_falls_back_to_verified_tools_model(selected)
         requests.append(body)
         if len(requests) == 1:
             return httpx.Response(404, json={"error": {"message": "No endpoint supports tools"}})
-        return httpx.Response(200, json=completion())
+        return httpx.Response(200, json=completion(model=body["model"]))
 
     p = provider(handler)
     try:
@@ -152,7 +160,8 @@ async def test_explicit_tools_model_falls_back_to_verified_tools_model(selected)
             model=selected,
         )
         assert [body["model"] for body in requests] == [selected, p.settings.model_tools]
-        assert requests[1]["reasoning"] == {"enabled": False}
+        assert requests[1]["reasoning_effort"] == "none"
+        assert "reasoning" not in requests[1]
         assert requests[1]["tools"] == requests[0]["tools"]
         assert len(result["attempts"]) == 2
     finally:
@@ -169,7 +178,7 @@ async def test_image_content_uses_only_configured_vision_route_even_with_explici
             return httpx.Response(404, json={"error": {"message": "No vision endpoint"}})
         return httpx.Response(200, json=completion())
 
-    p = provider(handler)
+    p = provider(handler, model_vision="qwen/qwen3.7-flash")
     try:
         await p.complete(
             [
@@ -201,9 +210,18 @@ async def test_successful_fallback_has_only_success_cost_and_disables_unrequeste
             return httpx.Response(503, json={"error": {"message": "unavailable"}})
         return httpx.Response(200, json=completion(model="inclusionai/ling-3.0-flash"))
 
-    p = provider(handler)
+    p = provider(
+        handler,
+        model_free="mistralai/mistral-nemo",
+        model_fallbacks="meta-llama/llama-3.1-8b-instruct,inclusionai/ling-3.0-flash",
+    )
     try:
         result = await p.complete([{"role": "user", "content": "hello"}])
+        assert [body["model"] for body in requests] == [
+            "mistralai/mistral-nemo",
+            "meta-llama/llama-3.1-8b-instruct",
+            "inclusionai/ling-3.0-flash",
+        ]
         assert requests[-1]["reasoning"] == {"enabled": False}
         assert result["usage"]["cost_rub"] == "0.002252988"
         assert [a["status"] for a in result["attempts"]] == ["http_error", "http_error", "success"]
@@ -225,6 +243,84 @@ async def test_read_timeout_is_not_retried_and_cost_stays_unknown():
             await p.complete([{"role": "user", "content": "hello"}])
         assert exc.value.cost_unknown is True
         assert len(calls) == 1
+    finally:
+        await p.close()
+
+
+@pytest.mark.parametrize("model", DIALOGUE_MODELS.values())
+@pytest.mark.parametrize("reasoning", [False, True], ids=["none", "high"])
+@pytest.mark.parametrize("vision", [False, True], ids=["text-tools", "vision-tools"])
+async def test_curated_gpt_wire_preserves_model_tools_and_images(model, reasoning, vision):
+    bodies = []
+    content = [{"type": "text", "text": "Проверь данные и вызови инструмент"}]
+    if vision:
+        content.append({"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}})
+    messages = [{"role": "user", "content": content}]
+    original_messages = json.loads(json.dumps(messages))
+    tools = [
+        {"type": "function", "function": {"name": "memory_list", "parameters": {"type": "object"}}}
+    ]
+
+    def handler(request):
+        body = json.loads(request.content)
+        bodies.append(body)
+        return httpx.Response(200, json=completion(model=body["model"]))
+
+    p = provider(handler, max_output_tokens=1024, model_vision="qwen/qwen3.7-flash")
+    try:
+        result = await p.complete(messages, tools=tools, model=model, reasoning=reasoning)
+        assert len(bodies) == 1
+        body = bodies[0]
+        assert body["model"] == model
+        assert body["reasoning_effort"] == ("high" if reasoning else "none")
+        assert body["max_completion_tokens"] == (16384 if reasoning else 1024)
+        assert not {"max_tokens", "reasoning"} & body.keys()
+        assert body["stream"] is False
+        assert body["tools"] == tools and body["tool_choice"] == "auto"
+        assert body["messages"] == original_messages == messages
+        assert result["usage"]["model"] == model
+        assert result["usage"]["cost_rub"] == "0.002252988"
+    finally:
+        await p.close()
+
+
+@pytest.mark.parametrize("model", DIALOGUE_MODELS.values())
+@pytest.mark.parametrize("reasoning", [False, True], ids=["none", "high"])
+async def test_selected_gpt_retries_keep_model_and_effort_without_downgrade(model, reasoning):
+    bodies = []
+
+    def handler(request):
+        body = json.loads(request.content)
+        bodies.append(body)
+        if len(bodies) == 1:
+            return httpx.Response(503, json={"error": {"message": "unavailable"}})
+        if len(bodies) == 2:
+            raise httpx.ConnectError("connection unavailable", request=request)
+        return httpx.Response(200, json=completion(model=body["model"]))
+
+    p = provider(
+        handler,
+        model_free="mistralai/mistral-nemo",
+        model_tools="deepseek/deepseek-v4-flash",
+        model_reasoning="deepseek/deepseek-v4-flash",
+        model_fallbacks="inclusionai/ling-3.0-flash",
+    )
+    try:
+        result = await p.complete(
+            [{"role": "user", "content": "Реши задачу"}], model=model, reasoning=reasoning
+        )
+        assert [body["model"] for body in bodies] == [model] * 3
+        assert all(body["reasoning_effort"] == ("high" if reasoning else "none") for body in bodies)
+        assert all(
+            body["max_completion_tokens"] == (16384 if reasoning else 4096) for body in bodies
+        )
+        assert all(not {"max_tokens", "reasoning"} & body.keys() for body in bodies)
+        assert [attempt["status"] for attempt in result["attempts"]] == [
+            "http_error",
+            "connection_error",
+            "success",
+        ]
+        assert result["usage"]["model"] == model
     finally:
         await p.close()
 
@@ -359,7 +455,7 @@ async def test_vision_switches_free_text_model_to_vision_route():
         selected.append(json.loads(request.content)["model"])
         return httpx.Response(200, json=completion())
 
-    p = provider(handler)
+    p = provider(handler, model_free="mistralai/mistral-nemo", model_vision="qwen/qwen3.7-flash")
     try:
         await p.complete(
             [

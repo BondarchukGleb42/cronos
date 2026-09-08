@@ -20,6 +20,7 @@ from cronos.initiative import (
 from cronos.library import LibraryStoreMixin
 from cronos.memory import MemoryStoreMixin
 from cronos.memory_privacy import invalidate_memory_context
+from cronos.model_preferences import normalize_model_choice
 from cronos.projects import ProjectsStoreMixin
 from cronos.recipes import RecipesStoreMixin
 from cronos.settings import Settings
@@ -312,6 +313,8 @@ class Store(
                 "➕ новый чат",
                 "🗑 удалить чат",
                 "🪐 главное меню",
+                "🤖 модель",
+                "🧠 режим рассуждения",
             }
         ):
             return None
@@ -1170,6 +1173,50 @@ class Store(
                     )
             return await conn.fetchval("SELECT preferences FROM users WHERE user_id=$1", user_id)
 
+    async def set_model_preferences(self, user_id: int, values: dict, source_key: str) -> dict:
+        """Apply a dialogue control once; a late replay never restores an older choice."""
+        if not isinstance(values, dict) or not values or set(values) - {"model", "reasoning"}:
+            raise ValueError("Неизвестная настройка диалога")
+        if not isinstance(source_key, str) or not source_key.strip():
+            raise ValueError("Не указан источник изменения настройки")
+        result = dict(values)
+        if "model" in result:
+            result["model"] = normalize_model_choice(result["model"])
+        if "reasoning" in result and not isinstance(result["reasoning"], bool):
+            raise ValueError("Режим рассуждения должен быть включён или выключен")
+        await self.ensure_user(user_id)
+        async with self.user_lock(user_id, purpose="delivery"), self.connection(user_id) as conn:
+            await conn.fetchval("SELECT user_id FROM users WHERE user_id=$1 FOR UPDATE", user_id)
+            existing = await conn.fetchrow("SELECT * FROM operations WHERE id=$1", source_key)
+            if existing:
+                if (
+                    existing["user_id"] != user_id
+                    or existing["kind"] != "model_preference"
+                    or not isinstance(existing["result"], dict)
+                    or not existing["result"]
+                    or set(existing["result"]) - {"model", "reasoning"}
+                ):
+                    raise ValueError("Операция настройки недоступна")
+                return existing["result"]
+            if await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM privacy_requests WHERE user_id=$1 AND state='erasing')",
+                user_id,
+            ):
+                raise ValueError("Сначала дождись завершения очистки данных")
+            await conn.execute(
+                "UPDATE users SET preferences=preferences||$2::jsonb WHERE user_id=$1",
+                user_id,
+                result,
+            )
+            await conn.execute(
+                """INSERT INTO operations(id,user_id,kind,result,status)
+                VALUES($1,$2,'model_preference',$3,'done')""",
+                source_key,
+                user_id,
+                result,
+            )
+            return result
+
     async def set_proactivity(self, user_id: int, enabled: bool, source_key: str) -> dict:
         """Apply one callback once; return its original minimal preference change on replay."""
         if not isinstance(enabled, bool):
@@ -1261,6 +1308,91 @@ class Store(
                 "SELECT * FROM conversations WHERE user_id=$1 AND is_home", user_id
             )
             return dict(row) if row else None
+
+    async def recover_missing_home_delivery(
+        self,
+        delivery_id: int,
+        owner: str,
+        *,
+        telegram_ids: list[int] | None = None,
+        remaining_payload: dict | None = None,
+    ) -> bool:
+        """Queue recovery after exact TOPIC_NOT_FOUND, under the delivery lock.
+
+        The worker owns remote creation under its work lock. This transaction
+        only retires the still-current missing home and records one durable job;
+        it must never acquire the work lock in the reverse order.
+        """
+        async with self.connection() as conn:
+            user_id = await conn.fetchval(
+                "SELECT user_id FROM outbox WHERE id=$1 AND owner=$2 AND state='sending'",
+                delivery_id,
+                owner,
+            )
+            if user_id is None:
+                return False
+            await conn.execute("SELECT set_config('app.user_id',$1,true)", str(user_id))
+            # Match the ingress/privacy lock order before locking the outbox.
+            if not await conn.fetchval(
+                "SELECT user_id FROM users WHERE user_id=$1 FOR UPDATE", user_id
+            ):
+                return False
+            delivery = await conn.fetchrow(
+                "SELECT * FROM outbox WHERE id=$1 AND owner=$2 AND state='sending' FOR UPDATE",
+                delivery_id,
+                owner,
+            )
+            if not delivery or delivery["thread_id"] <= 1 or delivery["chat_id"] != user_id:
+                return False
+            if await conn.fetchval(
+                "SELECT 1 FROM privacy_requests WHERE user_id=$1 AND state='erasing'", user_id
+            ):
+                return False
+            home = await conn.fetchrow(
+                """SELECT id FROM conversations WHERE user_id=$1 AND chat_id=$2
+                AND thread_id=$3 AND is_home FOR UPDATE""",
+                user_id,
+                delivery["chat_id"],
+                delivery["thread_id"],
+            )
+            if home is None:
+                return False
+            await conn.execute(
+                """UPDATE outbox SET state='failed',lease_until=NULL,error='Home topic not found',
+                telegram_ids=COALESCE($3,telegram_ids),payload=COALESCE($4,payload)
+                WHERE id=$1 AND owner=$2""",
+                delivery_id,
+                owner,
+                telegram_ids,
+                remaining_payload,
+            )
+            # Panels prepared before the reset must not overwrite the new home.
+            await conn.execute(
+                """UPDATE outbox SET state='cancelled',owner=NULL,lease_until=NULL,
+                error='Home topic replaced' WHERE user_id=$1 AND chat_id=$2 AND thread_id=$3
+                AND state IN ('pending','sending')
+                AND (dedupe_key LIKE 'home-panel:%' OR dedupe_key LIKE 'home-welcome:%')""",
+                user_id,
+                delivery["chat_id"],
+                delivery["thread_id"],
+            )
+            await conn.execute(
+                "UPDATE conversations SET is_home=false,revision=revision+1 WHERE id=$1",
+                home["id"],
+            )
+            generation = await conn.fetchval(
+                "UPDATE users SET home_generation=gen_random_uuid() WHERE user_id=$1 RETURNING home_generation",
+                user_id,
+            )
+            await conn.execute(
+                """INSERT INTO events(id,kind,payload)
+                VALUES(md5('cronos:home-init:' || $1::bigint::text || ':' || $2::text)::uuid,
+                       'home_init',jsonb_build_object('user_id',$1::bigint,'generation',$2::text))
+                ON CONFLICT(id) DO NOTHING""",
+                user_id,
+                str(generation),
+            )
+            return True
 
     async def home_creation_key(self, user_id: int) -> str:
         async with self.connection(user_id) as conn:

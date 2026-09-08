@@ -198,4 +198,4 @@ async def test_false_acknowledgement_is_not_reported_as_cleared(transport):
 
 def test_chat_keyboard_exposes_explicit_current_chat_deletion():
     labels = [button["text"] for row in new_chat_keyboard()["keyboard"] for button in row]
-    assert labels == ["➕ Новый чат", "🗑 Удалить чат", "🪐 Главное меню"]
+    assert labels == ["🤖 Модель", "🧠 Режим рассуждения", "🗑 Удалить чат"]

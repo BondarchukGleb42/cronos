@@ -12,22 +12,22 @@ class HomeUnavailable(Exception):
     pass
 
 
-async def ensure_home(store, transport, user_id, chat_id, source_key, *, verify=False):
-    """Return (conversation, created), without blindly retrying an unknown create."""
+def is_missing_topic_error(error: Exception) -> bool:
+    """Only an unambiguous Telegram response can authorize home recovery."""
+    return isinstance(error, TelegramBadRequest) and error.message.strip().casefold().removeprefix(
+        "bad request: "
+    ) in {"topic_not_found", "message thread not found", "forum topic not found"}
+
+
+async def ensure_home(store, transport, user_id, chat_id, source_key):
+    """Return the durable home without using a Telegram mutation as a read probe.
+
+    Bot API has no read-only topic lookup. Re-sending its name with editForumTopic
+    can produce a visible service message, so opening a panel must not rename it.
+    A missing topic is recovered only after an actual delivery failure;
+    neither opening the menu nor an uncertain create authorizes a new topic.
+    """
     home = await store.get_home(user_id)
-    if home and verify:
-        try:
-            await transport.edit_topic(chat_id, home["thread_id"], HOME_TITLE)
-        except TelegramBadRequest as error:
-            reason = error.message.strip().casefold().removeprefix("bad request: ")
-            if reason not in {
-                "topic_not_found",
-                "message thread not found",
-                "forum topic not found",
-            }:
-                raise
-            await store.reset_home(user_id, home["id"], source_key=f"home-missing:{source_key}")
-            home = None
     if home:
         # A previous attempt may have stored the topic and failed before enqueue.
         await welcome_home(store, home)

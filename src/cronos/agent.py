@@ -35,6 +35,13 @@ from cronos.initiative_tools import (
 )
 from cronos.library_tools import LIBRARY_TOOL_NAMES, execute_library_tool, recall_query
 from cronos.memory_tools import MEMORY_TOOL_NAMES, execute_memory_tool
+from cronos.model_preferences import (
+    DIALOGUE_MODELS,
+    MODEL_LABELS,
+    normalize_model_choice,
+    reasoning_enabled,
+    resolve_dialogue_model,
+)
 from cronos.multimodal import (
     clarification_before_image,
     generated_image_ids,
@@ -237,7 +244,7 @@ class Agent:
     ):
         user_id = run["user_id"]
         prefs = await self.store.preferences(user_id)
-        user = await self.store.ensure_user(user_id)
+        await self.store.ensure_user(user_id)
         projects: dict[str, Any]
         if initiative is not None:
             if not proactive or not scheduled:
@@ -369,8 +376,10 @@ dynamic=false годится только для отправки заранее
 Если задал такой уточняющий вопрос — закончи ход и дождись ответа; image_generate не вызывай.
 Не отправляй предварительный ответ перед генерацией. После успешного инструмента дай краткую
 подпись к изображению до 900 символов: она будет отправлена вместе с картинкой одним сообщением.
-Для сложного доказательства, многокритериального выбора или многошагового расчёта сам вызывай deep_reason;
-не включай дорогой reasoning для приветствий и простых вопросов.
+Режим рассуждения пользователя: {"глубокое рассуждение" if reasoning_enabled(prefs) else "без рассуждения"}.
+deep_reason доступен только в глубоком режиме; не включай его и не меняй модель автоматически.
+Настройки модели и рассуждения меняй только по прямой просьбе пользователя. Не предлагай их
+в обычном разговоре: человек выбирает их в нижней панели, когда ему это нужно.
 Не утверждай, что что-либо сохранил, отправил, создал или поменял, без успешного инструмента.
 Для удаления чата или полной очистки вызывай privacy_request: он только запрашивает подтверждение.
 Полная очистка стирает память, настройки, файлы, переписку и задания, сохраняя тариф и расходы.
@@ -424,14 +433,8 @@ dynamic=false годится только для отправки заранее
                 op = f"{run['id']}:model:{step}"
                 result = await self.store.operation(op)
                 if result is None:
-                    model = prefs.get("model") or (
-                        self.settings.model_free
-                        if user["plan"] == "FREE"
-                        else self.settings.model_tools
-                    )
-                    reasoning = bool(prefs.get("reasoning"))
-                    if reasoning and not prefs.get("model"):
-                        model = self.settings.model_reasoning
+                    model = resolve_dialogue_model(prefs, self.settings)
+                    reasoning = reasoning_enabled(prefs)
                     tools = available_tools(
                         scheduled=scheduled, proactive=proactive, initiative=initiative
                     )
@@ -446,6 +449,7 @@ dynamic=false годится только для отправки заранее
                                     state["messages"], item["function"]["name"]
                                 )
                             )
+                            and (reasoning or item["function"]["name"] != "deep_reason")
                         ]
                     last_preview = 0.0
 
@@ -871,17 +875,28 @@ dynamic=false годится только для отправки заранее
                 user, args["query"], current_run=run["id"], source_key=op, run_fence=run["fence"]
             )
         if name == "preferences_set":
+            args = dict(args)
+            if "model" in args:
+                args["model"] = normalize_model_choice(args["model"])
+            if "reasoning" in args and not isinstance(args["reasoning"], bool):
+                raise ValueError("reasoning must be a boolean")
             if "timezone" in args:
                 ZoneInfo(args["timezone"])
                 args["timezone_confirmed"] = True
+            dialogue = {key: args.pop(key) for key in ("model", "reasoning") if key in args}
+            if dialogue:
+                await self.store.set_model_preferences(user, dialogue, op + ":model-preference")
             return await self.store.preferences(user, args)
         if name == "deep_reason":
+            current_preferences = await self.store.preferences(user)
+            if not reasoning_enabled(current_preferences):
+                return {"error": "Режим рассуждения выключен. Реши задачу в текущем режиме."}
             result = await self.paid(
                 run,
                 op + ":usage",
                 lambda: self.provider.complete(
                     [{"role": "user", "content": args["problem"]}],
-                    model=self.settings.model_reasoning,
+                    model=resolve_dialogue_model(current_preferences, self.settings),
                     reasoning=True,
                 ),
             )
@@ -985,6 +1000,7 @@ dynamic=false годится только для отправки заранее
             }
         if name == "image_analyze":
             artifact = await self.store.get_artifact(user, args["artifact_id"])
+            current_preferences = await self.store.preferences(user)
             data, mime = await asyncio.to_thread(image_bytes, artifact, args.get("page", 1))
             prompt = [
                 {
@@ -1003,7 +1019,11 @@ dynamic=false годится только для отправки заранее
             result = await self.paid(
                 run,
                 op + ":usage",
-                lambda: self.provider.complete(prompt, model=self.settings.model_vision),
+                lambda: self.provider.complete(
+                    prompt,
+                    model=resolve_dialogue_model(current_preferences, self.settings),
+                    reasoning=reasoning_enabled(current_preferences),
+                ),
             )
             return {"text": result["message"].get("content", ""), "page": args.get("page", 1)}
         if name == "image_generate":
@@ -1073,13 +1093,12 @@ dynamic=false годится только для отправки заранее
                 creation_scope=f"run:{run['id']}",
             )
         if name == "models_list":
-            models = await self.provider.catalog()
             query = args.get("query", "").casefold()
             return [
-                {"id": model["id"], "name": model.get("name")}
-                for model in models
-                if query in (model["id"] + (model.get("name") or "")).casefold()
-            ][:60]
+                {"id": model, "name": MODEL_LABELS[model]}
+                for model in DIALOGUE_MODELS.values()
+                if query in (model + MODEL_LABELS[model]).casefold()
+            ]
         if name == "balance":
             return await self.store.balance(user)
         if name == "upgrade":

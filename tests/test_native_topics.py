@@ -113,7 +113,9 @@ async def test_native_topic_creation_preserves_owner_and_title_policy(implicit, 
     assert delivery[4] == f"topic-welcome:{OWNER_ID}:{THREAD_ID}"
     assert ("Название появится после моего ответа" in delivery[3]["text"]) is not manual
     labels = [button["text"] for row in delivery[3]["reply_markup"]["keyboard"] for button in row]
-    assert "➕ Новый чат" in labels
+    assert "🤖 Модель" in labels
+    assert "🧠 Режим рассуждения" in labels
+    assert "➕ Новый чат" not in labels
     assert "🗑 Удалить чат" in labels
     assert "inline_keyboard" not in delivery[3]["reply_markup"]
 

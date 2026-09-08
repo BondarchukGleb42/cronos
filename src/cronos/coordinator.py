@@ -10,6 +10,7 @@ from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, Teleg
 from redis.asyncio import Redis
 
 from cronos.billing import Reconciler
+from cronos.home import is_missing_topic_error
 from cronos.lifecycle import cancel_tasks, close_all, run_until_stopped
 from cronos.logging import configure_logging
 from cronos.settings import get_settings
@@ -183,6 +184,10 @@ class Coordinator:
                 if key in payload:
                     remainder[key] = payload[key]
             ids = (row.get("telegram_ids") or []) + error.sent_ids
+            if is_missing_topic_error(error.cause) and await self.store.recover_missing_home_delivery(
+                row["id"], self.owner, telegram_ids=ids, remaining_payload=remainder
+            ):
+                return True
             permanent = isinstance(
                 error.cause, (TelegramForbiddenError, TelegramBadRequest, FileNotFoundError)
             )
@@ -203,6 +208,10 @@ class Coordinator:
                 row["id"], self.owner, error="Telegram rate limit", retry_after=error.retry_after
             )
         except (TelegramForbiddenError, TelegramBadRequest, FileNotFoundError) as error:
+            if is_missing_topic_error(error) and await self.store.recover_missing_home_delivery(
+                row["id"], self.owner
+            ):
+                return True
             await self.store.delivery_result(
                 row["id"], self.owner, error=type(error).__name__, permanent=True
             )

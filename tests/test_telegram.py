@@ -363,8 +363,8 @@ async def test_edit_topic_rejects_invalid_thread_before_api_call(transport, thre
 def test_chat_keyboard_is_a_collapsible_text_panel():
     assert new_chat_keyboard() == {
         "keyboard": [
-            [{"text": "➕ Новый чат"}, {"text": "🗑 Удалить чат"}],
-            [{"text": "🪐 Главное меню"}],
+            [{"text": "🤖 Модель"}, {"text": "🧠 Режим рассуждения"}],
+            [{"text": "🗑 Удалить чат"}],
         ],
         "resize_keyboard": True,
         "is_persistent": False,

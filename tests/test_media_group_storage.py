@@ -394,6 +394,8 @@ async def test_commands_controls_other_thread_and_owner_are_not_joined(store):
                 "➕ Новый чат",
                 "🗑 Удалить чат",
                 "🪐 Главное меню",
+                "🤖 Модель",
+                "🧠 Режим рассуждения",
             ]
         )
     ]

@@ -4,6 +4,7 @@ import json
 import httpx
 import pytest
 
+from cronos.model_preferences import DIALOGUE_MODELS
 from cronos.providers import Provider, ProviderError
 from cronos.settings import Settings
 
@@ -83,7 +84,9 @@ async def test_title_uses_bounded_untrusted_text_and_preserves_request_settings(
         await p.complete([{"role": "user", "content": "regular request"}])
         regular = json.loads(requests[1].content)
         assert regular["model"] == p.settings.model_free
-        assert regular["max_tokens"] == 1024
+        assert regular["max_completion_tokens"] == 1024
+        assert regular["reasoning_effort"] == "none"
+        assert "max_tokens" not in regular and "reasoning" not in regular
         assert requests[1].extensions["timeout"]["read"] == 120
     finally:
         await p.close()
@@ -203,6 +206,31 @@ async def test_title_explicitly_disables_reasoning_for_reasoning_model_override(
     try:
         await p.topic_title([{"role": "user", "content": "A project"}])
         assert requests[0]["reasoning"] == {"enabled": False}
+    finally:
+        await p.close()
+
+
+@pytest.mark.parametrize("model", DIALOGUE_MODELS.values())
+async def test_gpt_title_override_keeps_small_budget_and_disables_reasoning(model):
+    requests = []
+
+    def handler(request):
+        requests.append(json.loads(request.content))
+        result = response()
+        body = result.json()
+        body["model"] = model
+        return httpx.Response(200, json=body)
+
+    p = provider(
+        handler, model_title=model, max_output_tokens=4096, reasoning_max_output_tokens=16384
+    )
+    try:
+        await p.topic_title([{"role": "user", "content": "План занятий"}])
+        assert len(requests) == 1
+        assert requests[0]["model"] == model
+        assert requests[0]["max_completion_tokens"] == 64
+        assert requests[0]["reasoning_effort"] == "none"
+        assert not {"max_tokens", "reasoning", "tools"} & requests[0].keys()
     finally:
         await p.close()
 

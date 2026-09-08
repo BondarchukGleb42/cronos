@@ -9,6 +9,7 @@ import pytest
 
 from cronos.agent import Agent, CancelledRun, analyze_table
 from cronos.capabilities import SKILLS, TOOLS, catalog_context
+from cronos.model_preferences import DIALOGUE_MODELS
 from cronos.settings import Settings
 from cronos.storage import Store
 
@@ -181,6 +182,101 @@ async def graph_case(request, tmp_path):
         finally:
             await store.close()
             await admin.close()
+
+
+@pytest.mark.parametrize("graph_case", [-920005], indirect=True)
+@pytest.mark.parametrize("plan", ["FREE", "START", "PREMIUM", "PRO"])
+async def test_every_plan_uses_luna_without_reasoning_by_default(graph_case, plan):
+    case = graph_case
+    await case.admin.execute("UPDATE users SET plan=$2 WHERE user_id=$1", case.user_id, plan)
+    # Existing users may have selected an old catalogue model before the migration.
+    await case.store.preferences(case.user_id, {"model": "qwen/qwen3.7-flash"})
+    case.provider.complete.return_value = model_response("Готово")
+    assert await case.agent.run(case.run, case.conversation, "Привет") == "Готово"
+    args = case.provider.complete.await_args.kwargs
+    assert args["model"] == DIALOGUE_MODELS["luna"]
+    assert args["reasoning"] is False
+    assert "deep_reason" not in {tool["function"]["name"] for tool in args["tools"]}
+
+
+@pytest.mark.parametrize("graph_case", [-920005], indirect=True)
+@pytest.mark.parametrize("model", DIALOGUE_MODELS.values())
+@pytest.mark.parametrize("reasoning", [False, True])
+async def test_explicit_model_and_mode_reach_the_real_graph(graph_case, model, reasoning):
+    case = graph_case
+    await case.store.set_model_preferences(
+        case.user_id, {"model": model, "reasoning": reasoning}, str(uuid4())
+    )
+    case.provider.complete.return_value = model_response("Готово")
+    await case.agent.run(case.run, case.conversation, "Привет")
+    args = case.provider.complete.await_args.kwargs
+    assert args["model"] == model
+    assert args["reasoning"] is reasoning
+    assert ("deep_reason" in {tool["function"]["name"] for tool in args["tools"]}) is reasoning
+
+
+async def test_deep_reason_cannot_bypass_disabled_mode(tmp_path):
+    store = SimpleNamespace(preferences=AsyncMock(return_value={"reasoning": False}))
+    provider = SimpleNamespace(complete=AsyncMock())
+    agent = Agent(Settings(artifacts_dir=str(tmp_path)), store, provider, None)
+    result = await agent.execute(
+        "deep_reason", {"problem": "Сложная задача"}, "test", {"user_id": -920005}, {}
+    )
+    assert "выключен" in result["error"]
+    provider.complete.assert_not_awaited()
+
+
+@pytest.mark.parametrize("model", DIALOGUE_MODELS.values())
+@pytest.mark.parametrize("reasoning", [False, True])
+async def test_artifact_vision_tool_preserves_model_and_reasoning(
+    tmp_path, monkeypatch, model, reasoning
+):
+    monkeypatch.setattr("cronos.agent.image_bytes", lambda artifact, page: (b"image", "image/png"))
+    store = SimpleNamespace(
+        preferences=AsyncMock(return_value={"model": model, "reasoning": reasoning}),
+        get_artifact=AsyncMock(return_value={}),
+    )
+    provider = SimpleNamespace(complete=AsyncMock(return_value=model_response("Красный")))
+    agent = Agent(Settings(artifacts_dir=str(tmp_path)), store, provider, None)
+
+    async def paid(run, op, function):
+        return await function()
+
+    agent.paid = paid
+    result = await agent.execute(
+        "image_analyze",
+        {"artifact_id": "test", "question": "Какой цвет?"},
+        "test",
+        {"user_id": -920005},
+        {},
+    )
+    assert result["text"] == "Красный"
+    args = provider.complete.await_args
+    assert args.kwargs == {"model": model, "reasoning": reasoning}
+    assert args.args[0][0]["content"][1]["image_url"]["url"].startswith("data:image/png;base64,")
+
+
+@pytest.mark.parametrize("graph_case", [-920005], indirect=True)
+async def test_freeform_model_patch_replay_preserves_later_button_choice(graph_case):
+    case = graph_case
+    op = str(uuid4())
+    await case.agent.execute(
+        "preferences_set",
+        {"model": "terra", "reasoning": True, "timezone": "Europe/Moscow"},
+        op,
+        case.run,
+        case.conversation,
+    )
+    await case.store.set_model_preferences(
+        case.user_id, {"model": "sol", "reasoning": False}, str(uuid4())
+    )
+    result = await case.agent.execute(
+        "preferences_set", {"model": "terra", "reasoning": True}, op, case.run, case.conversation
+    )
+    assert result["model"] == DIALOGUE_MODELS["sol"]
+    assert result["reasoning"] is False
+    assert result["timezone_confirmed"] is True
+    assert await case.store.operation(op) is None
 
 
 @pytest.mark.parametrize("graph_case", [-920001], indirect=True)

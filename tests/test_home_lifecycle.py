@@ -4,8 +4,6 @@ from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
-from aiogram.exceptions import TelegramBadRequest
-from aiogram.methods import EditForumTopic
 
 from cronos.home import HOME_TITLE, HomeUnavailable, ensure_home
 from cronos.home_views import main_panel
@@ -127,6 +125,7 @@ async def test_existing_home_requeues_same_welcome_key_without_second_create_or_
     assert second == (first[0], False)
     case.transport.create_topic.assert_awaited_once()
     assert len(case.store.outbox) == 1 and len(set(case.store.enqueue_keys)) == 1
+    case.transport.edit_topic.assert_not_awaited()
 
 
 async def test_enqueue_failure_after_home_promotion_recovers_without_new_topic(case):
@@ -159,33 +158,45 @@ async def test_unknown_remote_create_is_not_retried_under_new_source_without_exp
     assert case.transport.create_topic.await_count == 2
 
 
-async def test_missing_verified_home_rotates_with_stable_marker_and_retains_old_history(case):
+async def test_repeated_menu_events_do_not_rename_or_probe_existing_home(case):
+    home, _ = await ensure_home(case.store, case.transport, 42, 42, "source-1")
+    generation = case.store.generation
+    case.transport.topic_capabilities.reset_mock()
+    case.transport.create_topic.reset_mock()
+
+    for source in ("main", "chats", "tasks", "plans", "main-again"):
+        assert await ensure_home(case.store, case.transport, 42, 42, source) == (home, False)
+
+    case.transport.edit_topic.assert_not_awaited()
+    case.transport.create_topic.assert_not_awaited()
+    case.transport.topic_capabilities.assert_not_awaited()
+    assert case.store.generation == generation and case.store.resets == {}
+    assert len(case.store.outbox) == 1
+
+
+async def test_explicit_missing_home_reset_retains_old_history_and_creates_once(case):
     old, _ = await ensure_home(case.store, case.transport, 42, 42, "source-1")
     old_generation = case.store.generation
-    case.transport.edit_topic.side_effect = TelegramBadRequest(
-        method=EditForumTopic(chat_id=42, message_thread_id=77, name=HOME_TITLE),
-        message="Bad Request: TOPIC_NOT_FOUND",
-    )
+    key = await case.store.reset_home(42, old["id"], source_key="confirmed-missing-home")
+    assert await case.store.reset_home(42, old["id"], source_key="confirmed-missing-home") == key
     case.transport.create_topic.return_value = {"message_thread_id": 88, "name": HOME_TITLE}
-    home, created = await ensure_home(
-        case.store, case.transport, 42, 42, "verify-event", verify=True
-    )
+    home, created = await ensure_home(case.store, case.transport, 42, 42, "recovery-event")
     assert created and home["thread_id"] == 88
     assert old["is_home"] is False and 77 in case.store.chats
     assert case.store.generation != old_generation
-    assert list(case.store.resets) == ["home-missing:verify-event"]
+    assert list(case.store.resets) == ["confirmed-missing-home"]
+    assert await ensure_home(case.store, case.transport, 42, 42, "recovery-event") == (home, False)
+    assert case.transport.create_topic.await_count == 2
+    case.transport.edit_topic.assert_not_awaited()
 
 
-async def test_unrelated_verification_error_never_rotates_or_creates_home(case):
-    await ensure_home(case.store, case.transport, 42, 42, "source-1")
-    case.transport.edit_topic.side_effect = TelegramBadRequest(
-        method=EditForumTopic(chat_id=42, message_thread_id=77, name=HOME_TITLE),
-        message="Bad Request: CHAT_ADMIN_REQUIRED",
-    )
-    with pytest.raises(TelegramBadRequest):
-        await ensure_home(case.store, case.transport, 42, 42, "source-2", verify=True)
+async def test_unknown_home_lookup_failure_never_creates_a_replacement(case):
+    case.store.get_home = AsyncMock(side_effect=TimeoutError("database unavailable"))
+    with pytest.raises(TimeoutError):
+        await ensure_home(case.store, case.transport, 42, 42, "source-1")
     assert case.store.resets == {}
-    case.transport.create_topic.assert_awaited_once()
+    case.transport.create_topic.assert_not_awaited()
+    case.transport.edit_topic.assert_not_awaited()
 
 
 async def test_disabled_topics_return_general_without_fake_home_or_welcome_pin(case):

@@ -18,9 +18,11 @@ import certifi
 import httpx
 from openai import APIConnectionError, APIStatusError, APITimeoutError, AsyncOpenAI
 
+from cronos.model_preferences import DIALOGUE_MODELS
 from cronos.settings import Settings
 
 VERIFIED_SEARCH_MODEL = "perplexity/sonar"
+GPT_DIALOGUE_MODELS = frozenset(DIALOGUE_MODELS.values())
 REASONING_MODELS = {
     "qwen/qwen3.7-flash",
     "deepseek/deepseek-v4-flash",
@@ -145,6 +147,26 @@ class ProviderError(RuntimeError):
         self.usage = usage
         self.attempts = attempts or []
         self.cost_unknown = cost_unknown
+
+
+def _model_payload(payload: dict[str, Any], model: str) -> dict[str, Any]:
+    """Translate the reasoning choice for the model actually used by each attempt."""
+    request = dict(payload)
+    extra = dict(request.get("extra_body") or {})
+    if model in GPT_DIALOGUE_MODELS:
+        reasoning = extra.pop("reasoning", {})
+        request["reasoning_effort"] = (
+            "high" if reasoning.get("enabled") is True else "none"
+        )
+        if "max_tokens" in request:
+            request["max_completion_tokens"] = request.pop("max_tokens")
+    elif model in REASONING_MODELS:
+        extra.setdefault("reasoning", {"enabled": False})
+    if extra:
+        request["extra_body"] = extra
+    else:
+        request.pop("extra_body", None)
+    return request
 
 
 def _count(value: Any) -> int:
@@ -385,11 +407,7 @@ class Provider:
         attempts: list[dict[str, Any]] = []
         for attempt, model in enumerate(models[:3]):
             try:
-                request_payload = dict(payload)
-                if model in REASONING_MODELS:
-                    extra = dict(request_payload.get("extra_body") or {})
-                    extra.setdefault("reasoning", {"enabled": False})
-                    request_payload["extra_body"] = extra
+                request_payload = _model_payload(payload, model)
                 raw = await self._client.chat.completions.with_raw_response.create(
                     model=model,
                     messages=request_payload["messages"],
@@ -469,9 +487,10 @@ class Provider:
                     isinstance(part, dict) and part.get("type") == "image_url" for part in content
                 )
         fallbacks = [m.strip() for m in self.settings.model_fallbacks.split(",") if m.strip()]
-        if has_image:
+        if has_image and model not in GPT_DIALOGUE_MODELS:
             # MODEL_VISION is the configured image-capable route. An explicit
-            # text/reasoning model must not accidentally receive image history.
+            # unknown text-only model must not receive image history. The curated
+            # GPT models accept images, so preserve the user's selected model.
             model = self.settings.model_vision
         selected = model or (
             self.settings.model_reasoning
@@ -485,6 +504,7 @@ class Provider:
             and reasoning
             and selected in [self.settings.model_free, *fallbacks]
             and selected not in REASONING_MODELS
+            and selected not in GPT_DIALOGUE_MODELS
         ):
             selected = self.settings.model_reasoning
         payload: dict[str, Any] = {
@@ -496,9 +516,17 @@ class Provider:
             payload["tools"] = tools
             # Qwen's verified route accepts auto/none, not forced function choice.
             payload["tool_choice"] = "auto"
-        if reasoning or selected in REASONING_MODELS:
+        if reasoning or selected in REASONING_MODELS or selected in GPT_DIALOGUE_MODELS:
             payload["extra_body"] = {"reasoning": {"enabled": reasoning}}
-        if has_image:
+        if reasoning:
+            payload["max_tokens"] = max(
+                self.settings.max_output_tokens, self.settings.reasoning_max_output_tokens
+            )
+        if selected in GPT_DIALOGUE_MODELS:
+            # All three support tools and vision. Retrying must not silently change
+            # the selected model, its price or the requested reasoning mode.
+            chain = [selected] * 3
+        elif has_image:
             chain = [self.settings.model_vision] * 3
         elif tools:
             chain = [selected, self.settings.model_tools, self.settings.model_tools]
@@ -571,13 +599,9 @@ class Provider:
             try:
                 request = {
                     key: value
-                    for key, value in payload.items()
+                    for key, value in _model_payload(payload, model).items()
                     if key not in {"model", "messages", "stream", "stream_options"}
                 }
-                if model in REASONING_MODELS:
-                    extra = dict(request.get("extra_body") or {})
-                    extra.setdefault("reasoning", {"enabled": False})
-                    request["extra_body"] = extra
                 async with self._client.chat.completions.with_streaming_response.create(
                     model=model,
                     messages=payload["messages"],

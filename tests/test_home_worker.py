@@ -126,7 +126,7 @@ async def test_menu_entrypoints_are_deterministic_and_never_call_agent(case, tex
         42, 42, 77, main_panel(), f"home-panel:{case.event['id']}", 777
     )
     case.store.enqueue.assert_not_awaited()
-    assert case.ensure.call_args.kwargs == {"verify": True}
+    assert case.ensure.call_args.kwargs == {}
 
 
 async def test_new_home_menu_is_sent_by_welcome_once_without_duplicate_panel(case):

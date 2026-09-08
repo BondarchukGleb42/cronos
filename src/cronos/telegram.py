@@ -21,6 +21,7 @@ from aiogram.types import (
 )
 from aiohttp_socks import ProxyConnectionError, ProxyError, ProxyTimeoutError
 
+from cronos.advanced_controls import MODEL_BUTTON, REASONING_BUTTON
 from cronos.captions import caption_chunks
 from cronos.settings import Settings
 
@@ -81,8 +82,8 @@ def navigation_keyboard() -> dict:
     """A collapsible input panel; its buttons arrive as ordinary text messages."""
     return {
         "keyboard": [
-            [{"text": "➕ Новый чат"}, {"text": "🗑 Удалить чат"}],
-            [{"text": "🪐 Главное меню"}],
+            [{"text": MODEL_BUTTON}, {"text": REASONING_BUTTON}],
+            [{"text": "🗑 Удалить чат"}],
         ],
         "resize_keyboard": True,
         "is_persistent": False,

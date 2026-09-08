@@ -4,6 +4,7 @@ import json
 import httpx
 import pytest
 
+from cronos.model_preferences import DIALOGUE_MODELS
 from cronos.providers import Provider, ProviderError
 from cronos.settings import Settings
 
@@ -38,9 +39,11 @@ def response(*parts, error=None):
     )
 
 
-def provider(handler):
+def provider(handler, **overrides):
     return Provider(
-        Settings(database_url="postgresql://test", alltokens_api_key="private-test-key"),
+        Settings(
+            database_url="postgresql://test", alltokens_api_key="private-test-key", **overrides
+        ),
         http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
     )
 
@@ -185,7 +188,8 @@ async def test_connection_failure_before_headers_can_use_tools_fallback():
         if len(models) == 1:
             raise httpx.ConnectError("connection unavailable", request=request)
         assert body["tool_choice"] == "auto"
-        assert body["reasoning"] == {"enabled": False}
+        assert body["reasoning_effort"] == "none"
+        assert "reasoning" not in body and "max_tokens" not in body
         return response(event({"content": "ok"}, finish="stop"), b"data: [DONE]\n\n")
 
     p = provider(handler)
@@ -261,6 +265,115 @@ async def test_read_timeout_waiting_for_headers_does_not_retry():
             await p.complete([{"role": "user", "content": "go"}], on_delta=ignore_delta)
         assert len(calls) == 1
         assert caught.value.cost_unknown is True
+    finally:
+        await p.close()
+
+
+@pytest.mark.parametrize("model", DIALOGUE_MODELS.values())
+@pytest.mark.parametrize("reasoning", [False, True], ids=["none", "high"])
+@pytest.mark.parametrize("vision", [False, True], ids=["text-tools", "vision-tools"])
+async def test_curated_gpt_stream_wire_preserves_model_tools_images_and_usage(
+    model, reasoning, vision
+):
+    bodies, previews = [], []
+    content = [{"type": "text", "text": "Сравни данные"}]
+    if vision:
+        content.append({"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}})
+    messages = [{"role": "user", "content": content}]
+    original_messages = json.loads(json.dumps(messages))
+    tools = [
+        {"type": "function", "function": {"name": "memory_list", "parameters": {"type": "object"}}}
+    ]
+
+    def handler(request):
+        bodies.append(json.loads(request.content))
+        return response(
+            event({"content": "Первый"}, model=model),
+            event({"content": " ответ"}, model=model),
+            event(
+                finish="stop",
+                model=model,
+                usage={
+                    "prompt_tokens": 9,
+                    "completion_tokens": 11,
+                    "cost": "0.00123456789123456789",
+                },
+            ),
+            b"data: [DONE]\n\n",
+        )
+
+    async def preview(text):
+        previews.append(text)
+
+    p = provider(handler, max_output_tokens=1024, model_vision="qwen/qwen3.7-flash")
+    try:
+        result = await p.complete(
+            messages, tools=tools, model=model, reasoning=reasoning, on_delta=preview
+        )
+        assert len(bodies) == 1
+        body = bodies[0]
+        assert body["model"] == model
+        assert body["reasoning_effort"] == ("high" if reasoning else "none")
+        assert body["max_completion_tokens"] == (16384 if reasoning else 1024)
+        assert not {"max_tokens", "reasoning"} & body.keys()
+        assert body["stream"] is True and body["stream_options"] == {"include_usage": True}
+        assert body["tools"] == tools and body["tool_choice"] == "auto"
+        assert body["messages"] == original_messages == messages
+        assert previews == ["Первый", "Первый ответ"]
+        assert result["usage"]["model"] == model
+        assert result["usage"]["cost_rub"] == "0.00123456789123456789"
+        assert result["usage"]["request_id"] == "gen-stream"
+    finally:
+        await p.close()
+
+
+@pytest.mark.parametrize("model", DIALOGUE_MODELS.values())
+@pytest.mark.parametrize("reasoning", [False, True], ids=["none", "high"])
+async def test_selected_gpt_stream_retries_keep_model_and_mode_without_downgrade(model, reasoning):
+    bodies, previews = [], []
+
+    def handler(request):
+        body = json.loads(request.content)
+        bodies.append(body)
+        if len(bodies) == 1:
+            return httpx.Response(503, json={"error": {"message": "unavailable"}})
+        if len(bodies) == 2:
+            raise httpx.ConnectError("connection unavailable", request=request)
+        return response(
+            event({"content": "Готово"}, model=model, finish="stop", usage={"cost": "0.001"}),
+            b"data: [DONE]\n\n",
+        )
+
+    async def preview(text):
+        previews.append(text)
+
+    p = provider(
+        handler,
+        model_free="mistralai/mistral-nemo",
+        model_tools="deepseek/deepseek-v4-flash",
+        model_reasoning="deepseek/deepseek-v4-flash",
+        model_fallbacks="inclusionai/ling-3.0-flash",
+    )
+    try:
+        result = await p.complete(
+            [{"role": "user", "content": "Реши задачу"}],
+            model=model,
+            reasoning=reasoning,
+            on_delta=preview,
+        )
+        assert [body["model"] for body in bodies] == [model] * 3
+        assert all(body["reasoning_effort"] == ("high" if reasoning else "none") for body in bodies)
+        assert all(
+            body["max_completion_tokens"] == (16384 if reasoning else 4096) for body in bodies
+        )
+        assert all(not {"max_tokens", "reasoning"} & body.keys() for body in bodies)
+        assert [attempt["status"] for attempt in result["attempts"]] == [
+            "http_error",
+            "connection_error",
+            "success",
+        ]
+        assert previews == ["Готово"]
+        assert result["usage"]["model"] == model
     finally:
         await p.close()
 

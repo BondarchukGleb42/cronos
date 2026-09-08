@@ -194,5 +194,5 @@ async def test_home_operations_use_the_existing_proxy_session(monkeypatch):
         await value.close()
 
 
-def test_home_button_joins_existing_chat_navigation():
-    assert new_chat_keyboard()["keyboard"][-1] == [{"text": "🪐 Главное меню"}]
+def test_bottom_panel_keeps_explicit_current_chat_deletion():
+    assert new_chat_keyboard()["keyboard"][-1] == [{"text": "🗑 Удалить чат"}]

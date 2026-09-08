@@ -10,6 +10,7 @@ from uuid import UUID, uuid4
 
 import aio_pika
 
+from cronos.advanced_controls import ADVANCED_ENTRYPOINTS, advanced_callback, advanced_panel
 from cronos.agent import Agent, CancelledRun, setup_checkpoints
 from cronos.file_tasks import file_task
 from cronos.home import HomeUnavailable, ensure_home, unavailable_panel
@@ -175,6 +176,8 @@ class Worker:
             text = navigation_command(text)
             if await self.privacy_control(event, user_id, chat_id, thread_id, text, callback):
                 return
+            if await self.advanced_control(event, user_id, chat_id, thread_id, text, callback):
+                return
             if await self.home_control(event, user_id, chat_id, thread_id, text, callback):
                 return
             conversation = await self.store.conversation(user_id, chat_id, thread_id)
@@ -337,6 +340,44 @@ class Worker:
                     user_id, user_id, 0, unavailable_panel(str(error)), f"home-error:{event['id']}"
                 )
 
+    async def advanced_control(self, event, user_id, chat_id, thread_id, text, callback):
+        page = ADVANCED_ENTRYPOINTS.get(text.strip()) if not callback else None
+        values = None
+        data = (callback or {}).get("data") or ""
+        if data.startswith("advanced:"):
+            parsed = advanced_callback(data)
+            if parsed is None:
+                with suppress(Exception):
+                    await self.transport.bot.answer_callback_query(
+                        callback["id"], text="Открой выбор из нижней панели."
+                    )
+                return True
+            page, values = parsed
+            with suppress(Exception):
+                await self.transport.bot.answer_callback_query(callback["id"])
+        if page is None:
+            return False
+        if values is not None:
+            await self.store.set_model_preferences(
+                user_id, values, f"callback:{callback['id']}:model-preference"
+            )
+        preferences = await self.store.preferences(user_id)
+        panel = advanced_panel(page, preferences, self.settings)
+        if callback:
+            message_id = (callback.get("message") or {}).get("message_id")
+            if isinstance(message_id, int) and not isinstance(message_id, bool) and message_id > 0:
+                panel["edit_message_id"] = message_id
+        order = event.get("update_id") or event["payload"].get("update_id") or 0
+        await self.store.enqueue_home_panel(
+            user_id,
+            chat_id,
+            thread_id,
+            panel,
+            f"home-panel:advanced:{event['id']}",
+            order,
+        )
+        return True
+
     async def home_control(self, event, user_id, chat_id, thread_id, text, callback):
         command_pages = {
             "/start": "main",
@@ -400,7 +441,6 @@ class Worker:
                 user_id,
                 chat_id,
                 str(event["id"]),
-                verify=page == "main",
             )
         except HomeUnavailable as error:
             await self.store.enqueue(
